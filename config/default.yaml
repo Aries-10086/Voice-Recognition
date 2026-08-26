@@ -1,0 +1,152 @@
+# ============================================================
+# 系统默认配置文件
+# ============================================================
+
+system:
+  name: "CrossLingualVoiceClone"
+  version: "1.0.0"
+  device: "cuda"  # cuda / cpu
+  seed: 42
+  output_dir: "./outputs"
+  model_dir: "./models"  # 跨平台项目内缓存; Windows 可改为 D:/CodingPackage/models
+
+# ---------- ASR 语音识别 ----------
+asr:
+  engine: "faster_whisper"
+  model_name: "medium"            # CPU 友好; GPU 可改 large-v3
+  compute_type: "int8"
+  device: "cpu"                   # cuda / cpu (run_pipeline --device 会覆盖)
+  beam_size: 1                    # 1=greedy 最快; 2=略慢略准
+  num_workers: 1                  # 传给 WhisperModel 构造函数 (GPU 建议 1)
+  cpu_threads: 0                  # CPU 推理线程数 (0=自动)
+  language: "zh"
+  word_timestamps: true
+  condition_on_previous_text: false
+  vad_filter: true
+  min_silence_ms: 250             # VAD 静音阈值, 越小切段越碎
+  speech_pad_ms: 120
+  # 二次切段 (双人对话关键): 按词间静音/能量/最大时长再切
+  split_silence_seconds: 0.28
+  max_segment_seconds: 2.5
+  min_segment_seconds: 0.45
+  # FunASR 配置
+  funasr_model: "iic/SenseVoiceSmall"
+  vad_model: "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+  punc_model: "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
+
+# ---------- 语种识别 ----------
+language_id:
+  model_name: "facebook/mms-lid-4017"
+
+# ---------- 情感识别 ----------
+emotion:
+  engine: "emotion2vec"     # emotion2vec / speechbrain / wav2vec2_emotion
+  model_name: "iic/emotion2vec_base_finetuned"
+  wav2vec2_model: "superb/wav2vec2-base-superb-er"  # emotion2vec 不可用时的回退模型
+  # 情感类别映射
+  categories: ["neutral", "happy", "sad", "angry", "surprised", "fearful", "disgusted"]
+  embedding_dim: 768
+
+# ---------- LLM 翻译优化 ----------
+translation:
+  engine: "google"           # google(免费可靠) / local / openai_compatible
+  model_name: "Qwen/Qwen2.5-0.5B-Instruct"
+  api_base: "http://localhost:8000/v1"
+  temperature: 0.3
+  max_tokens: 512
+  emotion_weight: 0.3
+
+# ---------- 发音开闭感知 & 时间轴对齐 ----------
+alignment:
+  # AOCP-Net 创新模块配置
+  aocp:
+    sample_rate: 16000
+    window_size_ms: 25
+    hop_size_ms: 10
+    n_mels: 80
+    n_mfcc: 40
+    # 多尺度特征提取
+    multi_scale_windows: [20, 50, 100]  # ms
+    # 模型结构
+    encoder_dim: 256
+    lstm_layers: 3
+    lstm_hidden: 512
+    attention_heads: 8
+    dropout: 0.1
+  # 音素对齐
+  phoneme:
+    use_phonemizer: true
+    ctc_beam_size: 10
+  # 动态时间规整
+  dtw:
+    radius: 30  # Sakoe-Chiba band radius
+
+# ---------- 语音合成与声纹复刻 ----------
+synthesis:
+  # auto: 自动选择最优可用引擎  CosyVoice2(更优克隆) → Qwen3-TTS → edge-tts
+  engine: "auto"
+  # P0-B1: 演示时建议 true, 禁止静默落到 edge-tts (无真克隆)
+  require_clone_engine: false
+  allow_edge_fallback: true
+  qwen3_tts:
+    # 1.7B-Base: 支持语音克隆(声纹复刻) + 高质量
+    # (注: CustomVoice 不支持 generate_voice_clone, 只能预设音色, 无法克隆源说话人)
+    model_name: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    sample_rate: 24000
+  cosyvoice2:
+    # 更优的零样本跨语种克隆模型 (需先下载权重, 见 README)
+    # Mac/跨平台: 优先用项目内 ./models/ ; Windows 可改绝对路径
+    code_dir: "./models/CosyVoice2-0.5B"
+    pretrained_dir: "./models/cosyvoice2_pretrained"
+    sample_rate: 24000
+  emotion_injection: true
+  vocoder: "builtin"
+  # 生成参数 (Qwen3-TTS)
+  gen:
+    max_new_tokens: 2048
+    repetition_penalty: 1.1
+    top_p: 0.95
+    top_k: 50
+
+# ---------- Pipeline 集成 ----------
+pipeline:
+  # 流程步骤
+  steps:
+    - asr
+    - emotion_recognition
+    - translation
+    - aocp_analysis
+    - phoneme_alignment
+    - timeline_generation
+    - voice_synthesis
+  # 输出格式
+  output_format: "wav"
+  # 是否保留中间结果
+  keep_intermediate: true
+
+  # 说话人分离 (识别不同人声) — P0 调优
+  diarization:
+    engine: "auto"              # pyannote / wav2vec2_cluster / auto(自动回退)
+    max_speakers: 8
+    min_speakers: 1
+    expected_speakers: 2        # 对白验收: 段数足够时至少拆成 2 人; 独白改为 1
+    # 越小分得越细
+    distance_threshold: 0.40
+    retry_split_min_segments: 2 # 段数≥此值且人数不足时期望二次拆分
+    allow_single_speaker: true  # false=多人预期却分不出则直接报错
+    fallback_on_pyannote_fail: true
+    embedding: "spectral"       # spectral(推荐)/wav2vec2 — 勿用情感嵌入做分人
+
+  # 分段合成 (整段克隆 + 停顿控制)
+  segment:
+    onset_pad: 0.05             # 起始音/结束音边界向外扩展(秒)
+    energy_threshold_ratio: 0.25  # 起止音能量阈值(相对帧能量峰值)
+    fade_ms: 12                 # 单段首尾淡化(去咔哒声)
+    crossfade_ms: 25            # 组内相邻块交叉淡化(毫秒), 使连接更顺滑
+    min_gap: 0.08               # 组间最小静音(秒)
+    reference_min_seconds: 2.0  # 语音样本最短时长(秒)
+    reference_max_seconds: 8.0  # 语音样本最长时长(秒)
+    min_group_segments: 2       # 少于该段数的语气波动组并回上一组(去噪)
+    emotion_bucket: true        # 情感粗分桶, 减少抖动误切组
+    chunk_max_chars: 250        # 整段话切块的最大字符数 (避免长句生成中断)
+    chunk_max_sentences: 3      # 整段话切块的最大句数

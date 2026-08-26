@@ -1,0 +1,27 @@
+双人对话测试音频说明
+====================
+文件:
+  - dialog_two_speakers.wav      (系统 say 原始采样率)
+  - dialog_two_speakers_16k.wav  (16k mono，推荐给 pipeline)
+
+说话人:
+  A = Tingting（女声，中文）
+  B = Reed（男声，中文）
+  交替轮流，共 8 句（A-B-A-B-A-B-A-B）
+
+台词:
+  A: 你好，今天我们来讨论一下这个项目的进度。
+  B: 好的，我这边算法模块已经跑通了。
+  A: 目前语音克隆还分不太清不同说话人，听感也一般。
+  B: 是的，我建议先优化说话人分离和参考音绑定。
+  A: 那我们先把说话人分离做稳，再提升克隆质量。
+  B: 同意，我准备一段双人对话样例做验收。
+  A: 好的，那今天就先这样，下午继续联调。
+  B: 没问题，我把测试音频和结果摘要发你。
+
+验收期望:
+  summary 说话人数 >= 2
+  克隆结果听感上能分出两种音色
+
+运行:
+  python run_pipeline.py --input data/dialog_two_speakers_16k.wav --target-lang en

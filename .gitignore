@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# Models & caches (do not upload)
+models/
+**/huggingface/
+**/.cache/
+D:/
+D\:/
+
+# Outputs & temp
+outputs/
+*.log
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Large / local-only audio (keep small demo samples)
+vad_example.wav
+*.aiff
+
+# OS junk
+Thumbs.db
