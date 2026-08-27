@@ -16,8 +16,12 @@ faster-whisper>=1.0.3
 # --- 情感识别 (emotion2vec需手动安装, 代码已内置wav2vec2自动降级) ---
 # 手动安装emotion2vec: git clone https://github.com/ddlBoJack/emotion2vec.git && pip install -e emotion2vec/
 
-# --- 大语言模型 (OpenAI兼容API) ---
+# --- 大语言模型 / 翻译 ---
 openai>=1.45.0
+deep_translator>=1.11.0
+edge-tts>=6.1.0
+nltk>=3.8.0
+opencc-python-reimplemented>=0.1.7
 
 # --- 音频处理 ---
 librosa>=0.10.2
@@ -26,6 +30,8 @@ pydub>=0.25.1
 pyloudnorm>=0.1.0
 
 # --- 语音合成 (CosyVoice2需手动安装) ---
+# Qwen3-TTS: Python>=3.10 推荐; pip install qwen-tts (见项目 .venv)
+qwen-tts>=0.1.1
 # CosyVoice2: git clone https://github.com/FunAudioLLM/CosyVoice.git models/CosyVoice2-0.5B
 onnxruntime>=1.18.0
 

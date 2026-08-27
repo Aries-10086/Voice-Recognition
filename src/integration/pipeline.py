@@ -23,9 +23,13 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 # ============================================================
 # 将模型缓存重定向到项目本地 models/ 目录
 # ============================================================
+import platform
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 _win_models = Path("D:/CodingPackage/models")
-_MODEL_ROOT = _win_models if _win_models.exists() else (_PROJECT_ROOT / "models")
+if platform.system() == "Windows" and _win_models.exists():
+    _MODEL_ROOT = _win_models
+else:
+    _MODEL_ROOT = _PROJECT_ROOT / "models"
 _MODEL_ROOT.mkdir(parents=True, exist_ok=True)
 if not os.environ.get("HF_HOME"):
     os.environ["HF_HOME"] = str(_MODEL_ROOT / "huggingface")
@@ -35,12 +39,15 @@ if not os.environ.get("HF_HOME"):
     os.environ["XDG_CACHE_HOME"] = str(_MODEL_ROOT / ".cache")
     os.environ["TRANSFORMERS_CACHE"] = str(_MODEL_ROOT / "huggingface" / "hub")
     os.environ["CTRANSLATE2_MODELS"] = str(_MODEL_ROOT / "ctranslate2")
-    os.environ["NLTK_DATA"] = str(_MODEL_ROOT / "nltk_data")
-    try:
-        import nltk
-        nltk.data.path.insert(0, str(_MODEL_ROOT / "nltk_data"))
-    except ImportError:
-        pass
+_nltk = _PROJECT_ROOT / "models" / "nltk_data"
+if not _nltk.exists():
+    _nltk = _MODEL_ROOT / "nltk_data"
+os.environ["NLTK_DATA"] = str(_nltk)
+try:
+    import nltk
+    nltk.data.path.insert(0, str(_nltk))
+except ImportError:
+    pass
 # ============================================================
 
 import numpy as np
@@ -255,28 +262,66 @@ class CrossLingualPipeline:
             logger.info(f"  {result.detected_language}, {len(result.asr_result.segments) if result.asr_result else 0} segs, {n_spk} spk, {times['asr+emotion']:.1f}s")
 
             t1 = time.time()
-            logger.info("[3/7] Translation (phonetic-aware)...")
+            logger.info("[3/7] Translation (per-segment)...")
 
             if self.translator is not None and result.asr_result is not None:
-                # 收集音节时间轴传给翻译器
-                all_syllables = []
+                src_lang = result.detected_language or result.asr_result.language
+                emo = result.emotion_result.emotion if result.emotion_result else "neutral"
+                emo_i = result.emotion_result.intensity if result.emotion_result else 0.5
+                emo_v = result.emotion_result.valence if result.emotion_result else 0.0
+                tgt_parts = []
+                ok_n = 0
                 for seg in result.asr_result.segments:
-                    for syl in seg.get("syllables", []):
-                        all_syllables.append(syl)
-                self.translator._vowel_timeline = all_syllables
-
-                try:
-                    result.translation_result = self.translator.translate(
-                        text=result.asr_result.text,
-                        source_lang=result.detected_language or result.asr_result.language,
-                        target_lang=target_lang,
-                        emotion=result.emotion_result.emotion if result.emotion_result else "neutral",
-                        emotion_intensity=result.emotion_result.intensity if result.emotion_result else 0.5,
-                        emotion_valence=result.emotion_result.valence if result.emotion_result else 0.0,
-                    )
-                    logger.info(f"  {len(result.translation_result.translated_text)} chars, ratio={result.translation_result.length_ratio:.2f}")
-                except Exception as e:
-                    logger.warning(f"  failed: {e}")
+                    src = (seg.get("text") or "").strip()
+                    if not src:
+                        seg["tgt"] = ""
+                        continue
+                    try:
+                        tr = self.translator.translate(
+                            text=src,
+                            source_lang=src_lang,
+                            target_lang=target_lang,
+                            emotion=seg.get("emotion", emo),
+                            emotion_intensity=emo_i,
+                            emotion_valence=emo_v,
+                            refine=False,
+                        )
+                        tgt = (tr.translated_text or "").strip()
+                        if self.translator._is_bad_translation(tgt, src, target_lang):
+                            demo = self.translator._demo_phrase_translate(src, target_lang)
+                            tgt = (demo or "").strip()
+                        seg["tgt"] = tgt
+                        if tgt:
+                            ok_n += 1
+                            tgt_parts.append(tgt)
+                    except Exception as e:
+                        logger.warning(f"  seg translate fail: {e}")
+                        demo = self.translator._demo_phrase_translate(src, target_lang)
+                        seg["tgt"] = (demo or "").strip()
+                        if seg["tgt"]:
+                            ok_n += 1
+                            tgt_parts.append(seg["tgt"])
+                joined = " ".join(t for t in tgt_parts if t)
+                # 汇总 TranslationResult: 优先用逐段拼接统计音节 (避免整段失败导致 length_ratio 失真)
+                src_syl = self.translator._count_syllables(result.asr_result.text, src_lang)
+                tgt_syl = self.translator._count_syllables(joined, target_lang) if joined else 0
+                from src.translation.llm_translator import TranslationResult
+                result.translation_result = TranslationResult(
+                    source_text=result.asr_result.text,
+                    translated_text=joined,
+                    source_lang=src_lang,
+                    target_lang=target_lang,
+                    emotion=emo,
+                    source_syllables=src_syl,
+                    target_syllables=tgt_syl,
+                    length_ratio=tgt_syl / max(src_syl, 1),
+                    confidence=0.85 if ok_n == len(result.asr_result.segments) else 0.6,
+                    refinement_history=[joined],
+                )
+                logger.info(
+                    f"  per-seg ok={ok_n}/{len(result.asr_result.segments)}, "
+                    f"chars={len(joined)}, ratio={result.translation_result.length_ratio:.2f}"
+                )
             times["translation"] = time.time() - t1
             logger.info(f"  {times['translation']:.1f}s")
 
@@ -326,7 +371,7 @@ class CrossLingualPipeline:
                         logger.warning(f"   ⚠️ 目标语言音素转换失败: {e}, 使用字符拆分")
                         target_phonemes = list(result.translation_result.translated_text)
 
-                # 生成时间轴 (传入元音信息)
+                # 生成时间轴 (元音关键点传入后再计分, 避免覆盖后分数失效)
                 if self.timeline_generator is not None and result.aocp_result is not None:
                     length_ratio = 1.0
                     if result.translation_result is not None:
@@ -338,15 +383,17 @@ class CrossLingualPipeline:
                         source_duration=result.source_duration,
                         target_phonemes=target_phonemes,
                         length_ratio=length_ratio,
+                        vowel_timeline=src_vowels,
                     )
-                    # 用元音位置替换默认同步点
-                    if src_vowels:
-                        result.timeline_result.sync_points = [
-                            {"time": v["start"], "type": "vowel", "phoneme": v["phoneme"],
-                             "openness": v["openness"], "is_core": v["is_core"]}
-                            for v in src_vowels
-                        ]
-                    logger.info(f"   timeline: {len(result.timeline_result.speech_segments)} segments, sync={result.timeline_result.sync_score:.2f}, vowel_points={len(src_vowels)}")
+                    n_vowel_pts = sum(
+                        1 for p in result.timeline_result.sync_points
+                        if p.get("type") == "vowel"
+                    )
+                    logger.info(
+                        f"   timeline: {len(result.timeline_result.speech_segments)} segments, "
+                        f"sync={result.timeline_result.sync_score:.2f}, "
+                        f"vowel_points={n_vowel_pts}, coverage={result.timeline_result.coverage:.2f}"
+                    )
 
             times["phoneme"] = time.time() - t1
             logger.info(f"  {len(source_phonemes)} phonemes, {times['phoneme']:.1f}s")
@@ -644,23 +691,46 @@ class CrossLingualPipeline:
             }
             return self._normalize_ref(clip), ref_text, meta
 
-        q_score, q, best, clip, onset, offset = ranked[0]
-        if not q["ok"]:
-            weak = True
+        # 拼接同说话人多段, 凑够 ref_min, 避免单段过短
+        pieces = []
+        texts = []
+        total = 0.0
+        used_onsets = []
+        used_offsets = []
+        for q_score, q, seg, clip, onset, offset in ranked:
+            used_onsets.append(onset)
+            used_offsets.append(offset)
+            pieces.append(clip.astype(np.float32))
+            t = (seg.get("text") or "").strip()
+            if t:
+                texts.append(t)
+            total += len(clip) / sr
+            if total >= ref_min and (q.get("ok") or total >= ref_min * 1.2):
+                break
+            if total >= ref_max:
+                break
+
+        concat = np.concatenate(pieces) if pieces else ranked[0][3]
+        if len(concat) / sr > ref_max:
+            concat = concat[: int(ref_max * sr)]
+        q = self._ref_quality_score(concat, sr)
+        weak = not q["ok"]
+        if weak:
             logger.warning(
                 f"   参考音质控未通过 [{spk}]: {q['reason']} "
                 f"(dur={q['duration']}s rms={q['rms']}) → 弱克隆标记"
             )
-        ref_text = best.get("text", "").strip()[:200]
+        ref_text = " ".join(texts)[:200]
         meta = {
             "speaker": spk,
-            "onset": round(float(onset), 3),
-            "offset": round(float(offset), 3),
-            "weak_clone": weak or (not q["ok"]),
+            "onset": round(float(min(used_onsets) if used_onsets else 0.0), 3),
+            "offset": round(float(max(used_offsets) if used_offsets else 0.0), 3),
+            "weak_clone": weak,
             "quality": q,
             "source_text": ref_text,
+            "concat_pieces": len(pieces),
         }
-        return self._normalize_ref(clip.astype(np.float32)), ref_text, meta
+        return self._normalize_ref(concat.astype(np.float32)), ref_text, meta
 
     def _pick_reference(self, audio, sr, group, ref_min, ref_max):
         """兼容旧接口: 仅从组内选参考"""
@@ -864,9 +934,15 @@ class CrossLingualPipeline:
         for i, seg in enumerate(asr_segments):
             seg["emotion"] = seg_emotions.get(i, default_emotion)
 
-        # 3) 译文无损对齐
-        trans_sentences = self._split_translation(result, target_lang)
-        self._align_sentences(asr_segments, trans_sentences)
+        # 3) 译文: 优先用逐段已填的 tgt; 否则整段对齐兜底
+        if not any((s.get("tgt") or "").strip() for s in asr_segments):
+            trans_sentences = self._split_translation(result, target_lang)
+            self._align_sentences(asr_segments, trans_sentences)
+        else:
+            logger.info(
+                f"   使用逐段译文: "
+                f"{sum(1 for s in asr_segments if (s.get('tgt') or '').strip())}/{len(asr_segments)}"
+            )
 
         # 4) 分组
         groups = self._group_segments(asr_segments)
@@ -896,7 +972,10 @@ class CrossLingualPipeline:
             "supports_voice_clone": supports_clone,
             "n_speakers": n_speakers,
             "ignored_global_ref": bool(reference_audio_path) and n_speakers > 1,
+            "batch_mode": bool(use_batch),
         }
+        if use_batch:
+            logger.info("   Qwen3 batch clone: ON (prompt 复用 + clone_batch)")
         if not supports_clone:
             logger.warning(
                 "⚠️ 当前 TTS 无真克隆能力 — 听感可能仅限「能听」。"
@@ -963,11 +1042,22 @@ class CrossLingualPipeline:
                     wavs = [w.astype(np.float32) for w in wavs if w is not None and len(w) > 0]
                 else:
                     wavs = []
+                    # 源组覆盖时长, 用于轻量语速对齐 (B3, 仅真克隆引擎时启用)
+                    g0 = group["segs"][0]
+                    g1 = group["segs"][-1]
+                    src_dur = float(
+                        g1.get("offset", g1.get("end", 0))
+                        - g0.get("onset", g0.get("start", 0))
+                    )
+                    per_chunk = (src_dur / max(len(chunks), 1)) if src_dur > 0.3 else None
                     for c in chunks:
                         cl = self.voice_cloner.clone(
                             text=c, reference_audio=ref_audio, reference_sample_rate=sr,
                             reference_text=ref_text, emotion_label=emotion,
-                            target_lang=target_lang, target_duration=None)
+                            target_lang=target_lang,
+                            target_duration=per_chunk if supports_clone else None,
+                            speaker_id=spk,
+                        )
                         wavs.append(cl.audio.astype(np.float32))
                 # 轻微峰值归一, 降低组间响度跳变
                 group_audio = self._crossfade_concat(wavs, clone_sr, crossfade_ms)

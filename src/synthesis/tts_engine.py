@@ -125,10 +125,18 @@ class TTSEngine:
             model_name = self.config.get("qwen3_tts", {}).get(
                 "model_name", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
             )
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            # Mac: 优先 MPS → CUDA → CPU
+            if torch.cuda.is_available():
+                device = "cuda:0"
+                dtype = torch.bfloat16
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                device = "mps"
+                dtype = torch.float32
+            else:
+                device = "cpu"
+                dtype = torch.float32
 
-            logger.info(f"Loading Qwen3-TTS: {model_name}")
+            logger.info(f"Loading Qwen3-TTS: {model_name} ({device})")
             self.model = Qwen3TTSModel.from_pretrained(
                 model_name, device_map=device, dtype=dtype,
             )
@@ -283,6 +291,8 @@ class TTSEngine:
         target_duration: Optional[float] = None,
         reference_sample_rate: Optional[int] = None,
         voice_clone_prompt=None,
+        speaker_id: Optional[str] = None,
+        voice: Optional[str] = None,
     ) -> TTSResult:
         """
         语音合成
@@ -299,6 +309,8 @@ class TTSEngine:
             target_duration: 目标时长(秒), 生成后严格拉伸/压缩到该时长
             reference_sample_rate: 参考音频采样率
             voice_clone_prompt: 预计算的声纹克隆 prompt (复用, 加速)
+            speaker_id: 说话人标签 (edge 多音色映射)
+            voice: 显式指定 edge 音色
 
         Returns:
             TTSResult
@@ -317,9 +329,112 @@ class TTSEngine:
                 timeline_constraints, speed, target_lang
             )
         else:
+            if not voice:
+                voice = self.pick_edge_voice(target_lang, speaker_id)
             return self._synthesize_fallback(
+                text, emotion_label, timeline_constraints, target_lang, voice=voice
+            )
+
+    def _synthesize_fallback(
+        self,
+        text: str,
+        emotion_label: str,
+        timeline_constraints: Optional[List[Dict]],
+        target_lang: str,
+        voice: Optional[str] = None,
+    ) -> TTSResult:
+        """
+        降级合成: edge-tts → macOS say → 正弦波
+        """
+        try:
+            return self._synthesize_edge_tts(
+                text, emotion_label, target_lang, voice=voice
+            )
+        except Exception as e:
+            logger.warning(f"   edge-tts 不可用: {e}")
+        try:
+            return self._synthesize_macos_say(text, emotion_label, target_lang, speaker_voice=voice)
+        except Exception as e:
+            logger.warning(f"   macOS say 不可用: {e}, 使用正弦波降级")
+            return self._synthesize_sinewave(
                 text, emotion_label, timeline_constraints, target_lang
             )
+
+    def _synthesize_macos_say(
+        self,
+        text: str,
+        emotion_label: str,
+        target_lang: str,
+        speaker_voice: Optional[str] = None,
+    ) -> TTSResult:
+        """离线兜底: 系统 say (Mac), 按说话人换声保证可区分"""
+        import subprocess, tempfile, os
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("empty text for say")
+
+        # edge 音色名 → macOS 声线; 否则按语种默认
+        edge_to_say = {
+            "en-US-JennyNeural": "Samantha",
+            "en-US-GuyNeural": "Daniel",
+            "en-US-AriaNeural": "Karen",
+            "en-US-DavisNeural": "Aaron",
+            "zh-CN-XiaoxiaoNeural": "Tingting",
+            "zh-CN-YunxiNeural": "Reed",
+            "zh-CN-XiaoyiNeural": "Shelley",
+            "zh-CN-YunjianNeural": "Rocko",
+        }
+        if target_lang.startswith("zh"):
+            voices = ["Tingting", "Reed", "Shelley", "Rocko"]
+            default = "Tingting"
+        else:
+            voices = ["Samantha", "Daniel", "Karen", "Aaron"]
+            default = "Samantha"
+        voice = edge_to_say.get(speaker_voice or "", None) or default
+        if voice not in voices and speaker_voice:
+            # 稳定映射
+            try:
+                idx = abs(hash(speaker_voice)) % len(voices)
+                voice = voices[idx]
+            except Exception:
+                voice = default
+
+        rate = 175
+        if emotion_label in ("happy", "positive", "angry"):
+            rate = 190
+        elif emotion_label in ("sad", "negative"):
+            rate = 155
+
+        with tempfile.TemporaryDirectory() as td:
+            aiff = os.path.join(td, "out.aiff")
+            wav = os.path.join(td, "out.wav")
+            subprocess.run(
+                ["say", "-v", voice, "-r", str(rate), "-o", aiff, text],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["afconvert", "-f", "WAVE", "-d", "LEI16", aiff, wav],
+                check=True, capture_output=True,
+            )
+            import soundfile as sf
+            audio, sr = sf.read(wav)
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        import librosa
+        audio = librosa.resample(
+            audio.astype(np.float64), orig_sr=sr, target_sr=self.sample_rate
+        ).astype(np.float32)
+        duration = len(audio) / self.sample_rate
+        logger.info(f"macOS say: {duration:.1f}s voice={voice} emotion={emotion_label}")
+        return TTSResult(
+            audio=audio,
+            sample_rate=self.sample_rate,
+            duration=duration,
+            phonemes_used=[],
+            timeline=[],
+            emotion_applied=emotion_label,
+        )
 
     def _synthesize_qwen3_tts(
         self, text, reference_audio, reference_text,
@@ -492,86 +607,98 @@ class TTSEngine:
         finally:
             import os; os.unlink(ref_path) if os.path.exists(ref_path) else None
 
-    def _synthesize_fallback(
-        self,
-        text: str,
-        emotion_label: str,
-        timeline_constraints: Optional[List[Dict]],
-        target_lang: str,
-    ) -> TTSResult:
-        """
-        降级合成方案 - 优先使用 edge-tts (Microsoft 免费在线 TTS)
-        """
-        # 尝试用 edge-tts 生成真实语音
-        try:
-            return self._synthesize_edge_tts(text, emotion_label, target_lang)
-        except Exception as e:
-            logger.warning(f"   edge-tts 不可用: {e}, 使用正弦波降级")
-            return self._synthesize_sinewave(text, emotion_label, timeline_constraints, target_lang)
-
     def _synthesize_edge_tts(
         self, text: str, emotion_label: str, target_lang: str,
+        voice: Optional[str] = None,
     ) -> TTSResult:
         """使用 Microsoft Edge TTS 生成真实语音 (免费, 无需模型)"""
         import asyncio
         import tempfile
         import os
 
-        # 语种→Edge语音映射
+        # 语种→默认 Edge 语音
         voice_map = {
-            "zh": "zh-CN-XiaoxiaoNeural",      # 中文女声
-            "en": "en-US-JennyNeural",          # 英文女声
-            "ja": "ja-JP-NanamiNeural",         # 日文
-            "ko": "ko-KR-SunHiNeural",          # 韩文
+            "zh": "zh-CN-XiaoxiaoNeural",
+            "en": "en-US-JennyNeural",
+            "ja": "ja-JP-NanamiNeural",
+            "ko": "ko-KR-SunHiNeural",
         }
-        voice = voice_map.get(target_lang, "en-US-JennyNeural")
+        # 多人区分: 按 speaker 轮换不同音色 (无真克隆时的可演示兜底)
+        multi_voices = {
+            "en": [
+                "en-US-JennyNeural", "en-US-GuyNeural",
+                "en-US-AriaNeural", "en-US-DavisNeural",
+            ],
+            "zh": [
+                "zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural",
+                "zh-CN-XiaoyiNeural", "zh-CN-YunjianNeural",
+            ],
+            "ja": ["ja-JP-NanamiNeural", "ja-JP-KeitaNeural"],
+            "ko": ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"],
+        }
+        if not voice:
+            voice = voice_map.get(target_lang, "en-US-JennyNeural")
 
-        # 情感→语速/音调调整
-        rate_map = {"happy": "+10%", "sad": "-15%", "angry": "+20%", "neutral": "+0%"}
-        pitch_map = {"happy": "+5Hz", "sad": "-8Hz", "angry": "+10Hz", "neutral": "+0Hz"}
-
+        rate_map = {
+            "happy": "+10%", "sad": "-15%", "angry": "+20%",
+            "neutral": "+0%", "positive": "+8%", "negative": "-10%",
+        }
+        pitch_map = {
+            "happy": "+5Hz", "sad": "-8Hz", "angry": "+10Hz",
+            "neutral": "+0Hz", "positive": "+4Hz", "negative": "-6Hz",
+        }
         rate = rate_map.get(emotion_label, "+0%")
         pitch = pitch_map.get(emotion_label, "+0Hz")
 
-        # 截断过长文本 (edge-tts 有长度限制)
         max_chars = 2000
         if len(text) > max_chars:
             text = text[:max_chars] + "..."
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("edge-tts empty text")
 
         async def _generate():
             import edge_tts
             communicate = edge_tts.Communicate(
                 text, voice, rate=rate, pitch=pitch
             )
-            # 保存为临时文件
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 tmp_path = f.name
             await communicate.save(tmp_path)
             return tmp_path
 
-        # 运行异步
+        # 避免 "loop already running" / 陈旧 loop 导致空音频
         try:
-            loop = asyncio.get_event_loop()
+            tmp_path = asyncio.run(_generate())
         except RuntimeError:
             loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+            try:
+                tmp_path = loop.run_until_complete(_generate())
+            finally:
+                loop.close()
 
-        tmp_path = loop.run_until_complete(_generate())
+        if not tmp_path or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 64:
+            raise RuntimeError("edge-tts produced empty file")
 
-        # 读取音频
         import soundfile as sf
-        audio, sr = sf.read(tmp_path)
-        os.unlink(tmp_path)
+        try:
+            audio, sr = sf.read(tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
-        # 转为单声道并重采样到目标采样率
+        if audio is None or len(audio) == 0:
+            raise RuntimeError("edge-tts decode empty")
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
         import librosa
-        audio = librosa.resample(audio.astype(np.float64), orig_sr=sr, target_sr=self.sample_rate)
-
+        audio = librosa.resample(
+            audio.astype(np.float64), orig_sr=sr, target_sr=self.sample_rate
+        )
         duration = len(audio) / self.sample_rate
-        logger.info(f"🎵 edge-tts 合成: {duration:.1f}s, voice={voice}, emotion={emotion_label}")
-
+        logger.info(f"edge-tts: {duration:.1f}s voice={voice} emotion={emotion_label}")
         return TTSResult(
             audio=audio.astype(np.float32),
             sample_rate=self.sample_rate,
@@ -580,6 +707,30 @@ class TTSEngine:
             timeline=[],
             emotion_applied=emotion_label,
         )
+
+    def pick_edge_voice(self, target_lang: str, speaker_id: Optional[str] = None) -> str:
+        """按说话人稳定映射到不同 Edge 音色, 保证多人听感可区分"""
+        multi_voices = {
+            "en": [
+                "en-US-JennyNeural", "en-US-GuyNeural",
+                "en-US-AriaNeural", "en-US-DavisNeural",
+            ],
+            "zh": [
+                "zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural",
+                "zh-CN-XiaoyiNeural", "zh-CN-YunjianNeural",
+            ],
+            "ja": ["ja-JP-NanamiNeural", "ja-JP-KeitaNeural"],
+            "ko": ["ko-KR-SunHiNeural", "ko-KR-InJoonNeural"],
+        }
+        voices = multi_voices.get(target_lang, multi_voices["en"])
+        if not speaker_id:
+            return voices[0]
+        # 稳定哈希: SPEAKER_00 -> 0, SPEAKER_01 -> 1
+        try:
+            idx = int("".join(ch for ch in speaker_id if ch.isdigit()) or "0")
+        except ValueError:
+            idx = abs(hash(speaker_id)) % len(voices)
+        return voices[idx % len(voices)]
 
     def _synthesize_sinewave(
         self, text: str, emotion_label: str,

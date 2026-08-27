@@ -26,9 +26,13 @@ asr:
   min_silence_ms: 250             # VAD 静音阈值, 越小切段越碎
   speech_pad_ms: 120
   # 二次切段 (双人对话关键): 按词间静音/能量/最大时长再切
-  split_silence_seconds: 0.28
-  max_segment_seconds: 2.5
+  split_silence_seconds: 0.32
+  max_segment_seconds: 2.8
   min_segment_seconds: 0.45
+  # 碎句合并: 修复「還分|太清」「把說|話人」等半句切开
+  merge_gap_seconds: 0.35
+  merge_max_seconds: 4.8
+  merge_short_chars: 8
   # FunASR 配置
   funasr_model: "iic/SenseVoiceSmall"
   vad_model: "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
@@ -73,6 +77,8 @@ alignment:
     lstm_hidden: 512
     attention_heads: 8
     dropout: 0.1
+    # 预训练权重路径; 为空则强制能量 VAD (O7)
+    checkpoint: null
   # 音素对齐
   phoneme:
     use_phonemizer: true
@@ -80,18 +86,21 @@ alignment:
   # 动态时间规整
   dtw:
     radius: 30  # Sakoe-Chiba band radius
+  # 口型同步评分 (O7 / C1)
+  sync:
+    target_score: 0.65
 
 # ---------- 语音合成与声纹复刻 ----------
 synthesis:
   # auto: 自动选择最优可用引擎  CosyVoice2(更优克隆) → Qwen3-TTS → edge-tts
-  engine: "auto"
+  engine: "qwen3_tts"
   # P0-B1: 演示时建议 true, 禁止静默落到 edge-tts (无真克隆)
-  require_clone_engine: false
+  require_clone_engine: true
   allow_edge_fallback: true
   qwen3_tts:
     # 1.7B-Base: 支持语音克隆(声纹复刻) + 高质量
     # (注: CustomVoice 不支持 generate_voice_clone, 只能预设音色, 无法克隆源说话人)
-    model_name: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    model_name: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     sample_rate: 24000
   cosyvoice2:
     # 更优的零样本跨语种克隆模型 (需先下载权重, 见 README)
@@ -136,6 +145,10 @@ pipeline:
     allow_single_speaker: true  # false=多人预期却分不出则直接报错
     fallback_on_pyannote_fail: true
     embedding: "spectral"       # spectral(推荐)/wav2vec2 — 勿用情感嵌入做分人
+    prefer_f0: true             # 双人优先 F0 高低音二分
+    f0_min_spread_hz: 15.0      # F0 高低差阈值 (Hz)
+    turn_taking_correct: true   # O3: 静音轮次 + 交替校正
+    turn_gap_seconds: 0.35      # 超过该静音视为换人话轮
 
   # 分段合成 (整段克隆 + 停顿控制)
   segment:

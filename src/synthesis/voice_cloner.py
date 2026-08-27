@@ -194,6 +194,7 @@ class VoiceCloner:
         target_lang: str = "zh",
         target_duration: Optional[float] = None,
         voice_clone_prompt=None,
+        speaker_id: Optional[str] = None,
     ) -> ClonedSpeech:
         """
         执行语音克隆
@@ -209,6 +210,7 @@ class VoiceCloner:
             target_lang: 目标语言
             target_duration: 目标时长(秒), 严格对齐到该时长
             voice_clone_prompt: 预计算的声纹克隆 prompt (复用, 加速)
+            speaker_id: 说话人标签 (edge 多音色区分)
 
         Returns:
             ClonedSpeech 克隆结果
@@ -232,7 +234,7 @@ class VoiceCloner:
             ).astype(np.float32)
             reference_sample_rate = self.tts_engine.sample_rate
 
-        # 3. TTS合成 (传入目标时长, Qwen3-TTS 生成后严格对齐)
+        # 3. TTS合成
         tts_result = self.tts_engine.synthesize(
             text=text,
             reference_audio=reference_audio,
@@ -244,19 +246,31 @@ class VoiceCloner:
             target_duration=target_duration,
             reference_sample_rate=reference_sample_rate,
             voice_clone_prompt=voice_clone_prompt,
+            speaker_id=speaker_id,
         )
 
-        # 4. 音色处理: Qwen3-TTS已克隆 → 二次时长兜底; edge-tts → F0克隆
-        use_qwen = getattr(self.tts_engine, '_qwen3_available', False)
-        if use_qwen:
-            # Qwen3-TTS已做克隆, 兜底时长对齐(防止极端情况)
+        # 4. 后处理
+        engine = getattr(self.tts_engine, "engine_name", "")
+        use_real_clone = bool(
+            getattr(self.tts_engine, "_qwen3_available", False)
+            or getattr(self.tts_engine, "_cosyvoice_available", False)
+        )
+        if use_real_clone:
             cloned_audio = self._match_duration(
                 tts_result.audio, tts_result.sample_rate,
                 reference_audio, reference_sample_rate,
                 target_duration,
             )
+        elif engine == "edge_tts":
+            # edge 已用不同说话人音色区分; 跳过 WORLD(易毁掉听感/变短)
+            cloned_audio = tts_result.audio.astype(np.float32)
+            if target_duration and target_duration > 0.05:
+                cloned_audio = self._match_duration(
+                    cloned_audio, tts_result.sample_rate,
+                    reference_audio, reference_sample_rate,
+                    target_duration,
+                )
         else:
-            # edge-tts需要F0克隆
             cloned_audio = self._world_voice_conversion(
                 tts_result.audio, tts_result.sample_rate,
                 reference_audio, reference_sample_rate,

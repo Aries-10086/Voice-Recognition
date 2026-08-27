@@ -46,35 +46,44 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # ============================================================
 # 【关键】将模型缓存目录重定向到项目本地
-# Windows 若存在 D:/CodingPackage/models 则优先用之; 否则用项目 ./models
+# 仅在 Windows 且 D:/CodingPackage/models 存在时用该路径;
+# macOS 上勿匹配项目内名为 "D:" 的文件夹
 # ============================================================
+import platform
 _win_models = Path("D:/CodingPackage/models")
-if _win_models.exists():
+if platform.system() == "Windows" and _win_models.exists():
     _MODEL_ROOT = _win_models
 else:
     _MODEL_ROOT = PROJECT_ROOT / "models"
 _MODEL_ROOT.mkdir(parents=True, exist_ok=True)
 
-os.environ["HF_HOME"] = str(_MODEL_ROOT / "huggingface")
-os.environ["HUGGINGFACE_HUB_CACHE"] = str(_MODEL_ROOT / "huggingface" / "hub")
-os.environ["HF_HUB_CACHE"] = str(_MODEL_ROOT / "huggingface" / "hub")
+# 若外部已指定 HF_HOME 则保留; 否则写入项目 models/
+if not os.environ.get("HF_HOME"):
+    os.environ["HF_HOME"] = str(_MODEL_ROOT / "huggingface")
+os.environ["HUGGINGFACE_HUB_CACHE"] = os.environ.get(
+    "HUGGINGFACE_HUB_CACHE", str(Path(os.environ["HF_HOME"]) / "hub")
+)
+os.environ["HF_HUB_CACHE"] = os.environ["HUGGINGFACE_HUB_CACHE"]
 os.environ["TORCH_HOME"] = str(_MODEL_ROOT / "torch")
 os.environ["XDG_CACHE_HOME"] = str(_MODEL_ROOT / ".cache")
 # faster-whisper 下载目录
 os.environ["CTRANSLATE2_MODELS"] = str(_MODEL_ROOT / "ctranslate2")
 # transformers 离线缓存
-os.environ["TRANSFORMERS_CACHE"] = str(_MODEL_ROOT / "huggingface" / "hub")
+os.environ["TRANSFORMERS_CACHE"] = os.environ["HUGGINGFACE_HUB_CACHE"]
 # sentencepiece / tokenizers
 os.environ["SENTENCEPIECE_HOME"] = str(_MODEL_ROOT / "sentencepiece")
-# NLTK 数据 (g2p-en 音素转换)
-os.environ["NLTK_DATA"] = str(_MODEL_ROOT / "nltk_data")
+# NLTK 数据 (g2p-en 音素转换) — 优先项目 models/nltk_data
+_nltk = PROJECT_ROOT / "models" / "nltk_data"
+if not _nltk.exists():
+    _nltk = _MODEL_ROOT / "nltk_data"
+os.environ["NLTK_DATA"] = str(_nltk)
 # HF 镜像 (如网络正常则注释掉)
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # 注册 NLTK 路径
 try:
     import nltk
-    nltk.data.path.insert(0, str(_MODEL_ROOT / "nltk_data"))
+    nltk.data.path.insert(0, str(_nltk))
 except ImportError:
     pass
 
