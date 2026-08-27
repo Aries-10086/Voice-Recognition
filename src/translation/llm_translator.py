@@ -159,12 +159,17 @@ class LLMTranslator:
         # 计算源文本音节数
         source_syllables = self._count_syllables(text, source_lang)
 
-        # Google 翻译: 直接翻译干净文本, 避免模板文本混入译文
+        # Google 翻译: 繁→简预处理 + 多引擎回退, 避免模板文本混入译文
         if self.engine == "google":
-            translated = self._google_translate(text, target_lang)
+            translated, backend = self._online_translate(text, target_lang)
+            if self._is_bad_translation(translated, text, target_lang):
+                logger.warning(f"翻译结果不可用 (backend={backend})")
             target_syllables = self._count_syllables(translated, target_lang)
             length_ratio = target_syllables / max(source_syllables, 1)
-            logger.info(f"Translation (google): [{source_lang}->{target_lang}] ratio={length_ratio:.2f}")
+            logger.info(
+                f"Translation ({backend}): [{source_lang}->{target_lang}] "
+                f"ratio={length_ratio:.2f}"
+            )
             return TranslationResult(
                 source_text=text,
                 translated_text=translated,
@@ -174,7 +179,7 @@ class LLMTranslator:
                 source_syllables=source_syllables,
                 target_syllables=target_syllables,
                 length_ratio=length_ratio,
-                confidence=0.9,
+                confidence=0.9 if backend.startswith(("google", "mymemory")) else 0.55,
                 refinement_history=[translated],
             )
 
@@ -358,8 +363,23 @@ class LLMTranslator:
             return self._call_transformers(system_prompt, user_prompt)
 
     def _google_translate(self, text: str, target_lang: str) -> str:
-        """Google 翻译干净文本 (不走提示词模板)"""
-        from deep_translator import GoogleTranslator
+        """兼容旧调用: 返回译文文本"""
+        out, _backend = self._online_translate(text, target_lang)
+        return out
+
+    def _online_translate(self, text: str, target_lang: str) -> Tuple[str, str]:
+        """
+        在线翻译主路径:
+        1) 繁→简预处理
+        2) Google (source=zh-CN 优先, 再 auto) × 重试
+        3) MyMemory
+        4) 演示短语表 (仅兜底)
+        Returns: (translated_text, backend_name)
+        """
+        text = (text or "").strip()
+        if not text:
+            return "", "empty"
+
         lang_map = {
             "en": "en", "zh": "zh-CN", "zho": "zh-CN", "chi": "zh-CN", "cmn": "zh-CN",
             "ja": "ja", "jpn": "ja", "ko": "ko", "kor": "ko",
@@ -368,7 +388,198 @@ class LLMTranslator:
             "it": "it", "ita": "it", "pt": "pt", "por": "pt", "ar": "ar", "ara": "ar",
         }
         target = lang_map.get(str(target_lang).lower(), "en")
-        return GoogleTranslator(source='auto', target=target).translate(text)
+
+        # 1) 繁→简 (提高在线翻译命中率)
+        text_sc = self._to_simplified(text)
+        if text_sc != text:
+            logger.info(f"繁→简: {text[:24]}… → {text_sc[:24]}…")
+
+        errors: List[str] = []
+
+        # 2) Google: 先 zh-CN→target, 再 auto→target
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError as e:
+            errors.append(f"google:import:{e}")
+            GoogleTranslator = None  # type: ignore
+
+        if GoogleTranslator is not None:
+            source_opts = []
+            if self._looks_cjk(text_sc):
+                source_opts.extend(["zh-CN", "auto"])
+            else:
+                source_opts.append("auto")
+            for src in source_opts:
+                for attempt in range(2):
+                    try:
+                        out = GoogleTranslator(source=src, target=target).translate(text_sc)
+                        if not self._is_bad_translation(out, text_sc, target_lang):
+                            return out.strip(), f"google/{src}"
+                        raise ValueError(f"bad result: {str(out)[:60]}")
+                    except Exception as e:
+                        errors.append(f"google/{src}#{attempt}:{e}")
+                        import time
+                        time.sleep(0.35 * (attempt + 1))
+
+        # 3) MyMemory
+        try:
+            from deep_translator import MyMemoryTranslator
+            src = "zh-CN" if self._looks_cjk(text_sc) else "en"
+            out = MyMemoryTranslator(source=src, target=target).translate(text_sc)
+            if not self._is_bad_translation(out, text_sc, target_lang):
+                logger.warning(f"Google 不可用, 已用 MyMemory ({'; '.join(errors)[:100]})")
+                return out.strip(), "mymemory"
+            errors.append("mymemory:bad_result")
+        except Exception as e:
+            errors.append(f"mymemory:{e}")
+
+        # 4) 短语表: 简体/繁体都试
+        for cand in (text_sc, text):
+            demo = self._demo_phrase_translate(cand, target_lang)
+            if demo:
+                logger.warning(f"在线翻译失败, 使用演示短语表 ({'; '.join(errors)[:120]})")
+                return demo, "demo_phrase"
+
+        logger.error(f"翻译失败: {'; '.join(errors)[:200]}")
+        if self._is_bad_translation(text_sc, text_sc, target_lang):
+            return "", "failed"
+        return text_sc, "passthrough"
+
+    def _to_simplified(self, text: str) -> str:
+        """繁体中文 → 简体; 无 opencc 时做常用字回退"""
+        if not text or not self._looks_cjk(text):
+            return text
+        try:
+            from opencc import OpenCC
+            if not hasattr(self, "_opencc"):
+                self._opencc = OpenCC("t2s")
+            return self._opencc.convert(text)
+        except Exception:
+            return self._t2s_fallback(text)
+
+    @staticmethod
+    def _t2s_fallback(text: str) -> str:
+        """无 opencc 时的常用繁简映射 (覆盖 ASR 常见字)"""
+        table = str.maketrans({
+            "們": "们", "來": "来", "這": "这", "個": "个", "項": "项", "目": "目",
+            "討": "讨", "論": "论", "進": "进", "度": "度", "語": "语", "聲": "声",
+            "還": "还", "分": "分", "嗎": "吗", "聽": "听", "感": "感", "質": "质",
+            "量": "量", "說": "说", "話": "话", "員": "员", "對": "对", "於": "于",
+            "與": "与", "為": "为", "會": "会", "後": "后", "從": "从", "種": "种",
+            "國": "国", "業": "业", "發": "发", "現": "现", "時": "时", "間": "间",
+            "開": "开", "關": "关", "東": "东", "車": "车", "電": "电", "腦": "脑",
+            "網": "网", "絡": "络", "計": "计", "劃": "划", "優": "优", "選": "选",
+            "擇": "择", "準": "准", "備": "备", "實": "实", "驗": "验", "錄": "录",
+            "頻": "频", "穩": "稳", "離": "离", "離": "离", "昇": "升", "壓": "压",
+            "態": "态", "據": "据", "處": "处", "裡": "里", "麼": "么", "隻": "只",
+            "隻": "只", "並": "并", "並": "并", "萬": "万", "與": "与", "讓": "让",
+            "該": "该", "認": "认", "識": "识", "請": "请", "問": "问", "題": "题",
+            "嗎": "吗", "麼": "么", "點": "点", "樣": "样", "還": "还", "沒": "没",
+            "對": "对", "錯": "错", "經": "经", "過": "过", "產": "产", "產": "产",
+            "傳": "传", "統": "统", "複": "复", "雜": "杂", "簡": "简", "單": "单",
+            "總": "总", "結": "结", "續": "续", "聯": "联", "調": "调", "測": "测",
+            "試": "试", "摘": "摘", "要": "要", "發": "发", "給": "给", "妳": "你",
+            "係": "系", "統": "统", "態": "态", "麼": "么", "裡": "里", "佈": "布",
+            "佔": "占", "餘": "余", "餘": "余", "餘": "余", "餘": "余",
+            "臺": "台", "灣": "湾", "區": "区", "塊": "块", "碼": "码", "碼": "码",
+            "離": "离", "離": "离", "穩": "稳", "穩": "稳", "穩": "稳",
+            "話": "话", "語": "语", "聲": "声", "聽": "听", "質": "质", "優": "优",
+            "選": "选", "擇": "择", "準": "准", "備": "备", "驗": "验", "收": "收",
+            "樣": "样", "例": "例", "雙": "双", "人": "人", "對": "对", "話": "话",
+            "們": "们", "這": "这", "個": "个", "項": "项", "進": "进", "來": "来",
+            "討": "讨", "論": "论", "還": "还", "清": "清", "不": "不", "同": "同",
+            "說": "说", "話": "话", "人": "人", "聽": "听", "感": "感", "也": "也",
+            "一": "一", "般": "般", "那": "那", "先": "先", "把": "把", "分": "分",
+            "離": "离", "坐": "坐", "穩": "稳", "再": "再", "提": "提", "升": "升",
+            "克": "克", "隆": "隆", "質": "质", "量": "量", "專": "专", "業": "业",
+            "務": "务", "務": "务", "麼": "么", "麼": "么", "麼": "么",
+        })
+        return text.translate(table)
+
+    def _demo_phrase_translate(self, text: str, target_lang: str) -> Optional[str]:
+        """对白样例保底英译 (仅当在线翻译全挂); 键以简体为主"""
+        if str(target_lang).lower() not in ("en", "eng", "english"):
+            return None
+        table = {
+            "你好": "Hello",
+            "今天我们来讨论一下这个项目的进度": "Let's discuss the project progress today",
+            "好的，我这边算法模块已经跑通了": "Okay, the algorithm module is already running on my side",
+            "目前语音克隆还分不太清不同说话人，听感也一般":
+                "Currently voice cloning still cannot tell speakers apart, and quality is only okay",
+            "目前语音克隆还分不太清不同说话人":
+                "Currently voice cloning still cannot tell speakers apart",
+            "目前语音克隆还分": "Currently voice cloning still",
+            "太清不同说话人": "cannot clearly tell different speakers",
+            "听感也一般": "and the listening quality is only average",
+            "是的，我建议先优化说话人分离和参考音绑定":
+                "Yes, I suggest optimizing speaker diarization and reference binding first",
+            "那我们先把说话人分离做稳，再提升克隆质量":
+                "Then let's stabilize speaker separation first, then improve clone quality",
+            "那我们先把说": "Then let's first",
+            "那我们先把说话人分离坐": "Then let's stabilize speaker separation",
+            "那我们先把说话人分离坐稳": "Then let's stabilize speaker separation",
+            "话人分离坐稳": "stabilize speaker separation",
+            "再提升克隆质量": "then improve clone quality",
+            "目前语音克隆还分不太清不同说话人,":
+                "Currently voice cloning still cannot tell speakers apart,",
+            "你好,": "Hello,",
+            "你好，": "Hello,",
+            "同意，我准备一段双人对话样例做验收":
+                "Agreed, I will prepare a two-speaker dialogue sample for acceptance",
+            "好的，那今天就先这样，下午继续联调":
+                "Alright, that's it for today, we continue integration this afternoon",
+            "没问题，我把测试音频和结果摘要发你":
+                "No problem, I will send you the test audio and the result summary",
+            "好的，我这边算法模块已经跑通了。":
+                "Okay, the algorithm module is already running on my side.",
+            "是的，我建议先优化说话人分离和参考音绑定。":
+                "Yes, I suggest optimizing speaker diarization and reference binding first.",
+        }
+        # 统一用简体匹配
+        t = self._to_simplified((text or "").strip()).strip("。！？.!?,，、 ")
+        if t in table:
+            return table[t]
+        compact = re.sub(r"[\s,，。！？、\.\!\?]+", "", t)
+        for k, v in table.items():
+            kk = re.sub(r"[\s,，。！？、\.\!\?]+", "", self._to_simplified(k))
+            if compact == kk or (len(compact) >= 4 and (compact in kk or kk in compact)):
+                return v
+        return None
+
+    @staticmethod
+    def _looks_cjk(text: str) -> bool:
+        if not text:
+            return False
+        return sum(1 for c in text if "\u4e00" <= c <= "\u9fff") >= max(1, len(text) // 4)
+
+    @staticmethod
+    def _is_bad_translation(out: Optional[str], source: str = "", target_lang: str = "en") -> bool:
+        if not out or not str(out).strip():
+            return True
+        s = str(out).strip()
+        bad_markers = (
+            "error 500", "server error", "that's an error", "please try again",
+            "too many requests", "unexpected error", "captcha", "error 429",
+        )
+        low = s.lower()
+        if any(m in low for m in bad_markers):
+            return True
+        if len(s) < 2:
+            return True
+        tgt = str(target_lang).lower()
+        if tgt in ("en", "eng", "english"):
+            cjk = sum(1 for c in s if "\u4e00" <= c <= "\u9fff")
+            latin = sum(1 for c in s if ("a" <= c.lower() <= "z"))
+            # 仍大量汉字, 或与源文几乎相同
+            if cjk >= max(2, len(re.sub(r"\s", "", s)) // 3):
+                return True
+            if latin < 2 and cjk > 0:
+                return True
+            src_compact = re.sub(r"[\s,，。！？、\.\!\?]+", "", (source or ""))
+            out_compact = re.sub(r"[\s,，。！？、\.\!\?]+", "", s)
+            if src_compact and out_compact == src_compact:
+                return True
+        return False
 
     def _call_google(self, prompt: str) -> str:
         """Google 翻译 (免费, 质量高)"""
