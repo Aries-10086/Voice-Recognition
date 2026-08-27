@@ -55,6 +55,15 @@ PINYIN_VOWELS = {"a", "o", "e", "i", "u", "v", "ai", "ei", "ao", "ou",
                  "ian", "in", "iang", "ing", "iong", "ua", "uo", "uai",
                  "ui", "uan", "un", "uang", "ueng", "ve", "vn", "van"}
 
+# 按长度降序, 便于从拼音音节中切韵母
+_PINYIN_FINALS_SORTED = sorted(PINYIN_VOWELS, key=len, reverse=True)
+
+# ARPAbet 元音 (g2p_en)
+ARPA_VOWELS = {
+    "AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER", "EY",
+    "IH", "IY", "OW", "OY", "UH", "UW",
+}
+
 
 class PhonemeAligner:
     """
@@ -129,6 +138,27 @@ class PhonemeAligner:
         # 简单按字符分割
         return list(text)
 
+    @staticmethod
+    def _strip_tone_or_stress(phoneme: str) -> str:
+        """去掉拼音声调 / ARPAbet 重音数字"""
+        import re
+        return re.sub(r"[0-9]+$", "", (phoneme or "").strip())
+
+    @classmethod
+    def _pinyin_final(cls, phoneme: str) -> Optional[str]:
+        """从带调拼音音节提取韵母; 非拼音返回 None"""
+        import re
+        base = cls._strip_tone_or_stress(phoneme).lower()
+        if not base or not re.fullmatch(r"[a-z]+", base):
+            return None
+        for final in _PINYIN_FINALS_SORTED:
+            if base.endswith(final):
+                # 声母+韵母 或 零声母韵母
+                initial = base[: -len(final)] if len(base) > len(final) else ""
+                if initial == "" or re.fullmatch(r"[bpmfdtnlgkhjqxzcsrwy]+", initial):
+                    return final
+        return None
+
     def classify_articulatory_openness(self, phoneme: str) -> Tuple[str, float]:
         """
         【创新点】根据音素推断口腔开合程度
@@ -139,8 +169,26 @@ class PhonemeAligner:
         Returns:
             (openness_class, estimated_openness)
         """
+        # 拼音音节 → 用韵母估计开口度
+        final = self._pinyin_final(phoneme)
+        if final is not None:
+            if final in ("a", "ai", "ao", "an", "ang", "ia", "ua", "uai", "uan", "uang"):
+                return ("open", 0.75)
+            if final in ("o", "e", "uo", "ou", "ong", "er", "en", "eng"):
+                return ("mid", 0.55)
+            return ("mid", 0.45)
+
+        base = self._strip_tone_or_stress(phoneme)
+        arpa = base.upper()
+        if arpa in ARPA_VOWELS:
+            if arpa in ("AA", "AE", "AO", "AW", "AY"):
+                return ("open", 0.8)
+            if arpa in ("EH", "AH", "ER", "OW", "OY"):
+                return ("mid", 0.55)
+            return ("closed", 0.25)
+
         for class_name, phonemes in CROSS_LINGUAL_PHONEME_MAP.items():
-            if phoneme in phonemes:
+            if phoneme in phonemes or base.lower() in phonemes:
                 if class_name in ("open", "near_open"):
                     return ("open", 0.85)
                 elif class_name in ("mid_open", "mid"):
@@ -158,24 +206,26 @@ class PhonemeAligner:
     def extract_vowel_timeline(
         self, alignment: PhonemeAlignment
     ) -> List[Dict]:
-        """从音素对齐中提取元音时间轴"""
+        """从音素对齐中提取元音时间轴 (兼容带调拼音 / ARPAbet)"""
         vowels = []
         for i, (ph, start, end) in enumerate(zip(
             alignment.phonemes, alignment.start_times, alignment.end_times
         )):
-            # 中文拼音元音: 韵母部分即为元音
+            base = self._strip_tone_or_stress(ph)
+            final = self._pinyin_final(ph)
+            arpa = base.upper()
             is_vowel = False
-            if any(ph.endswith(v) for v in PINYIN_VOWELS):
+            if final is not None:
+                # 每个拼音音节都有韵母核, 作为口型同步点
                 is_vowel = True
-            elif any(ph == v for v in ["a","e","i","o","u"]):
+            elif arpa in ARPA_VOWELS:
                 is_vowel = True
-            elif ph in VOWEL_PHONEMES:
+            elif base.lower() in VOWEL_PHONEMES or base.lower() in ("a", "e", "i", "o", "u"):
                 is_vowel = True
 
             if is_vowel:
                 openness_class, openness_val = self.classify_articulatory_openness(ph)
-                # 拼音韵母通常开口度较高, 适当提高
-                if any(ph.endswith(v) for v in ["a","ao","ang","ia","ua","ai"]):
+                if final in ("a", "ao", "ang", "ia", "ua", "ai") or arpa in ("AA", "AE", "AO"):
                     openness_val = max(openness_val, 0.55)
                 vowels.append({
                     "index": i, "phoneme": ph,

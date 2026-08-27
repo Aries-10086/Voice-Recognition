@@ -266,6 +266,16 @@ class AOCPNet(nn.Module):
         self.sample_rate = sample_rate
         self.hop_ms = hop_ms
         self.hop_samples = int(sample_rate * hop_ms / 1000)
+        # 无预训练权重时 predict() 强制走能量 VAD (随机初始化不可用)
+        self.has_pretrained_weights = False
+        ckpt = aocp_cfg.get("checkpoint")
+        if ckpt:
+            try:
+                self.load_state_dict(torch.load(ckpt, map_location="cpu"))
+                self.has_pretrained_weights = True
+                logger.info(f"AOCP-Net 已加载权重: {ckpt}")
+            except Exception as e:
+                logger.warning(f"AOCP-Net 权重加载失败, 将使用能量VAD: {e}")
 
         # 特征提取
         self.feature_extractor = MultiScaleFeatureExtractor(
@@ -377,16 +387,30 @@ class AOCPNet(nn.Module):
         # 状态分段
         state_segments = self._build_state_segments(state_labels, self.hop_ms)
 
-        # 【兜底】如果模型只输出1段或0个开口段，用能量VAD替代
+        # 【兜底】无预训练权重 / 输出不可靠 → 能量 VAD
         n_open = sum(1 for s in state_segments if s["state"] == "open")
-        if len(state_segments) <= 1 or n_open == 0:
+        open_dur = sum(s["duration"] for s in state_segments if s["state"] == "open")
+        total_dur = max(len(audio) / self.sample_rate, 1e-3)
+        open_ratio = open_dur / total_dur
+        need_vad = (
+            not getattr(self, "has_pretrained_weights", False)
+            or len(state_segments) <= 1
+            or n_open == 0
+            or open_ratio < 0.15
+            or open_ratio > 0.95
+            or n_open < max(2, int(total_dur / 4.0))
+        )
+        if need_vad:
+            reason = "no_pretrained" if not self.has_pretrained_weights else "unreliable_nn"
+            logger.info(
+                f"AOCP 用能量VAD兜底 ({reason}; segs={len(state_segments)}, open={n_open}, "
+                f"open_ratio={open_ratio:.2f})"
+            )
             state_segments = self._energy_vad(audio, self.sample_rate, self.hop_ms)
-            # 用能量比例近似开合度
-            total_energy = audio.astype(np.float64) ** 2
             openness_np = np.zeros_like(openness_np)
             for seg in state_segments:
-                s = int(seg["start"] * self.sample_rate / (self.hop_ms * self.sample_rate / 1000))
-                e = int(seg["end"] * self.sample_rate / (self.hop_ms * self.sample_rate / 1000))
+                s = int(seg["start"] * 1000 / self.hop_ms)
+                e = int(seg["end"] * 1000 / self.hop_ms)
                 s, e = max(0, s), min(len(openness_np), e)
                 if e > s:
                     openness_np[s:e] = seg.get("openness", 0.5)
@@ -410,73 +434,106 @@ class AOCPNet(nn.Module):
         """
         基于能量的语音活动检测 (VAD)
         当神经网络输出不可靠时的兜底方案
+
+        改进:
+        - 百分位阈值 + 噪声底
+        - 短静音挂起合并 (hangover), 避免对话被切碎
+        - 补齐首尾闭口段
         """
         import librosa
 
-        # 计算RMS能量
         hop_len = int(sample_rate * hop_ms / 1000)
         rms = librosa.feature.rms(y=audio.astype(np.float64), hop_length=hop_len)[0]
+        if len(rms) == 0:
+            total_dur = len(audio) / max(sample_rate, 1)
+            return [{"start": 0, "end": total_dur, "duration": total_dur,
+                     "state": "open", "openness": 0.5}]
 
-        # 自适应阈值: 能量中位数的0.3倍
-        threshold = np.median(rms) * 0.3
-        if threshold < 1e-6:
-            threshold = np.mean(rms) * 0.2
+        # 自适应阈值: 噪声底 + 动态范围
+        p20 = float(np.percentile(rms, 20))
+        p80 = float(np.percentile(rms, 80))
+        med = float(np.median(rms))
+        threshold = max(p20 * 1.8, med * 0.35, (p20 + (p80 - p20) * 0.15))
+        if threshold < 1e-8:
+            threshold = float(np.mean(rms)) * 0.2 + 1e-8
 
-        # 标记有声/无声
         is_speech = rms > threshold
 
-        # 合并相邻帧
+        # hangover: 短静音并回说话 (约 80–120ms)
+        hang = max(2, int(0.1 * sample_rate / hop_len))
+        speech_mask = is_speech.copy()
+        last_speech = -10**9
+        for i in range(len(speech_mask)):
+            if is_speech[i]:
+                last_speech = i
+                speech_mask[i] = True
+            elif i - last_speech <= hang:
+                speech_mask[i] = True
+
+        # 反向 hangover (起音前短暂保留)
+        next_speech = 10**9
+        for i in range(len(speech_mask) - 1, -1, -1):
+            if is_speech[i]:
+                next_speech = i
+                speech_mask[i] = True
+            elif next_speech - i <= hang // 2:
+                speech_mask[i] = True
+
+        min_speech_frames = max(3, int(0.12 * sample_rate / hop_len))
         segments = []
         in_speech = False
         start_frame = 0
-        min_speech_frames = max(3, int(0.1 * sample_rate / hop_len))  # 至少100ms
-        min_silence_frames = max(2, int(0.05 * sample_rate / hop_len))
+        rms_max = float(np.max(rms)) + 1e-8
 
-        for i in range(len(is_speech)):
-            if is_speech[i] and not in_speech:
+        for i in range(len(speech_mask)):
+            if speech_mask[i] and not in_speech:
                 start_frame = i
                 in_speech = True
-            elif not is_speech[i] and in_speech:
+            elif not speech_mask[i] and in_speech:
                 if i - start_frame >= min_speech_frames:
                     segments.append({
                         "start": start_frame * hop_ms / 1000.0,
                         "end": i * hop_ms / 1000.0,
                         "duration": (i - start_frame) * hop_ms / 1000.0,
                         "state": "open",
-                        "openness": min(1.0, float(np.mean(rms[start_frame:i]) / max(rms) * 1.5)),
+                        "openness": min(1.0, float(np.mean(rms[start_frame:i]) / rms_max * 1.5)),
                     })
                 in_speech = False
 
-        # 最后一段
-        if in_speech and len(is_speech) - start_frame >= min_speech_frames:
+        if in_speech and len(speech_mask) - start_frame >= min_speech_frames:
             segments.append({
                 "start": start_frame * hop_ms / 1000.0,
-                "end": len(is_speech) * hop_ms / 1000.0,
-                "duration": (len(is_speech) - start_frame) * hop_ms / 1000.0,
+                "end": len(speech_mask) * hop_ms / 1000.0,
+                "duration": (len(speech_mask) - start_frame) * hop_ms / 1000.0,
                 "state": "open",
-                "openness": min(1.0, float(np.mean(rms[start_frame:]) / max(rms) * 1.5)),
+                "openness": min(1.0, float(np.mean(rms[start_frame:]) / rms_max * 1.5)),
             })
 
-        # 如果什么都没检测到，整段视为语音
+        total_dur = len(audio) / sample_rate
         if not segments:
-            total_dur = len(audio) / sample_rate
             segments = [{
                 "start": 0, "end": total_dur, "duration": total_dur,
                 "state": "open", "openness": 0.5,
             }]
 
-        # 在开口段之间插入闭口段
+        # 开口段之间插入闭口段, 并补齐首尾
         result = []
         prev_end = 0.0
         for seg in segments:
-            if seg["start"] > prev_end + 0.03:  # 间隔>30ms插入闭口段
+            if seg["start"] > prev_end + 0.03:
                 result.append({
                     "start": prev_end, "end": seg["start"],
                     "duration": seg["start"] - prev_end,
-                    "state": "closed",
+                    "state": "closed", "openness": 0.05,
                 })
             result.append(seg)
             prev_end = seg["end"]
+        if prev_end < total_dur - 0.03:
+            result.append({
+                "start": prev_end, "end": total_dur,
+                "duration": total_dur - prev_end,
+                "state": "closed", "openness": 0.05,
+            })
 
         return result
 
