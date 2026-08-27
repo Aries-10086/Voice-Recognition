@@ -231,18 +231,184 @@ class WhisperASR:
             if (seg["end"] - seg["start"]) < min_seg * 0.6:
                 # 并入上一段
                 prev["end"] = seg["end"]
-                prev["text"] = (prev.get("text", "") + seg.get("text", "")).strip()
+                prev["text"] = self._join_seg_text(prev.get("text", ""), seg.get("text", ""))
                 prev["words"] = (prev.get("words") or []) + (seg.get("words") or [])
                 prev["syllables"] = (prev.get("syllables") or []) + (seg.get("syllables") or [])
             elif (prev["end"] - prev["start"]) < min_seg * 0.6:
                 seg["start"] = prev["start"]
-                seg["text"] = (prev.get("text", "") + seg.get("text", "")).strip()
+                seg["text"] = self._join_seg_text(prev.get("text", ""), seg.get("text", ""))
                 seg["words"] = (prev.get("words") or []) + (seg.get("words") or [])
                 seg["syllables"] = (prev.get("syllables") or []) + (seg.get("syllables") or [])
                 merged[-1] = seg
             else:
                 merged.append(seg)
+
+        # 语义/缺口碎句合并 (半词、半句)
+        n1 = len(merged)
+        merged = self._merge_broken_phrases(merged)
+        if len(merged) != n1:
+            logger.info(f"ASR phrase-merge: {n1} -> {len(merged)} segments")
         return merged
+
+    @staticmethod
+    def _join_seg_text(a: str, b: str) -> str:
+        """拼接两段文本: 中文紧贴, 英文补空格"""
+        a = (a or "").strip()
+        b = (b or "").strip()
+        if not a:
+            return b
+        if not b:
+            return a
+        # 去掉拼接处重复标点
+        if b[0] in ",，、;；":
+            b = b[1:].lstrip()
+        cjk_a = sum(1 for c in a if "\u4e00" <= c <= "\u9fff")
+        cjk_b = sum(1 for c in b if "\u4e00" <= c <= "\u9fff")
+        if cjk_a >= max(1, len(a) // 3) or cjk_b >= max(1, len(b) // 3):
+            return (a + b).strip()
+        if a[-1].isalnum() and b[0].isalnum():
+            return f"{a} {b}".strip()
+        return (a + b).strip()
+
+    @staticmethod
+    def _cjk_chars(text: str) -> int:
+        return sum(1 for c in (text or "") if "\u4e00" <= c <= "\u9fff")
+
+    @staticmethod
+    def _has_terminal_punct(text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        return t[-1] in "。！？.!?;；…"
+
+    @classmethod
+    def _looks_incomplete_end(cls, text: str) -> bool:
+        """上一句像半截 (功能词/半词结尾、无句末标点)"""
+        import re
+        t = (text or "").strip().rstrip(",，、;；")
+        if not t or cls._has_terminal_punct(t):
+            return False
+        # 英文介词/冠词结尾
+        if re.search(
+            r"(?i)\b(the|a|an|to|of|for|and|or|but|with|in|on|at|by|from|into|is|are|was|were|be|let'?s|we|i|you)$",
+            t,
+        ):
+            return True
+        # 中文: 挂起助词/半截动词结构 (不含可独立成句的结尾)
+        if re.search(
+            r"(把说|把說|还分|還分|不太|先把|我们先|我們先|"
+            r"把|将|將|还|還|分|不|太|的|了|着|過|过|和|与|與|对|對|从|從|"
+            r"在|是|有|要|会|會|能|可|就|都|也|很|更|再|先|来|來|去|给|給|"
+            r"说|說|话|話)$",
+            t,
+        ):
+            return True
+        # 很短且无句末 (≤4字, 避免「听感也一般」被误判)
+        if cls._cjk_chars(t) > 0 and cls._cjk_chars(t) <= 4 and not cls._has_terminal_punct(t):
+            return True
+        return False
+
+    @classmethod
+    def _looks_continuation_start(cls, text: str) -> bool:
+        """下一句像接续而非新开话轮"""
+        import re
+        t = (text or "").strip().lstrip(",，、;；")
+        if not t:
+            return False
+        # 典型接续碎片 (来自对话样例与常见半句)
+        if re.match(
+            r"^(太清|话人|話人|人分离|人分離|不同说话|不同說話|说话人|說話人|"
+            r"克隆质量|克隆質量|坐稳|坐穩|进度|進度|听感|聽感|也一般|"
+            r"分离|分離)",
+            t,
+        ):
+            return True
+        # 明确的新句起手 → 不是接续
+        if re.match(
+            r"^(你好|您好|喂|嗯|啊|哦|好的|是的|对|對|嗯嗯|今天|目前|那我们|那我們|"
+            r"然后|然後|所以|因为|因為|如果|但是|不过|不過|另外|首先|其次|"
+            r"再提升|接下来|接下來|下一步|另外|同时|同時|"
+            r"Hello|Hi|Okay|Yes|No|Well|So|Then|Alright|Next|Also)",
+            t,
+            re.I,
+        ):
+            return False
+        # 英文小写开头接续
+        if t[0].islower():
+            return True
+        # 短中文且不像招呼/主语起句
+        if cls._cjk_chars(t) > 0 and cls._cjk_chars(t) <= 8:
+            return True
+        return False
+
+    def _merge_broken_phrases(self, segments: List[Dict]) -> List[Dict]:
+        """
+        合并被静音误切的半句/半词。
+        例: 「目前語音克隆還分」+「太清不同說話人」
+            「那我們先把說」+「話人分離坐穩」
+        """
+        if len(segments) <= 1:
+            return segments
+
+        max_gap = float(self.config.get("merge_gap_seconds", 0.35))
+        max_dur = float(self.config.get("merge_max_seconds", 4.8))
+        short_chars = int(self.config.get("merge_short_chars", 8))
+
+        def should_merge(prev: Dict, nxt: Dict) -> bool:
+            gap = float(nxt["start"]) - float(prev["end"])
+            if gap > max_gap:
+                return False
+            merged_dur = float(nxt["end"]) - float(prev["start"])
+            if merged_dur > max_dur:
+                return False
+            pt = (prev.get("text") or "").strip()
+            nt = (nxt.get("text") or "").strip()
+            if not pt or not nt:
+                return gap <= max_gap * 0.5
+            # 已有句末标点且下一段像新句 → 不并
+            if self._has_terminal_punct(pt) and not self._looks_continuation_start(nt):
+                return False
+            if self._looks_incomplete_end(pt) or self._looks_continuation_start(nt):
+                return True
+            # 紧挨着且双方都偏短 (避免把「再提升…」并进完整上句)
+            pc, nc = self._cjk_chars(pt), self._cjk_chars(nt)
+            if gap <= 0.12 and not self._has_terminal_punct(pt):
+                if pc and nc and pc <= short_chars and nc <= short_chars:
+                    return True
+                if pc == 0 and nc == 0 and len(pt) <= 18 and len(nt) <= 18:
+                    return True
+            return False
+
+        out: List[Dict] = [segments[0].copy()]
+        for seg in segments[1:]:
+            prev = out[-1]
+            cur = {k: (list(v) if isinstance(v, list) else v) for k, v in seg.items()}
+            if should_merge(prev, cur):
+                prev["end"] = cur["end"]
+                prev["text"] = self._join_seg_text(prev.get("text", ""), cur.get("text", ""))
+                prev["words"] = (prev.get("words") or []) + (cur.get("words") or [])
+                prev["syllables"] = (prev.get("syllables") or []) + (cur.get("syllables") or [])
+            else:
+                out.append(cur)
+
+        # 再扫一遍, 处理 A+B 合并后仍与 C 半句相连
+        if len(out) >= 2:
+            changed = True
+            while changed and len(out) >= 2:
+                changed = False
+                new_out: List[Dict] = [out[0]]
+                for seg in out[1:]:
+                    prev = new_out[-1]
+                    if should_merge(prev, seg):
+                        prev["end"] = seg["end"]
+                        prev["text"] = self._join_seg_text(prev.get("text", ""), seg.get("text", ""))
+                        prev["words"] = (prev.get("words") or []) + (seg.get("words") or [])
+                        prev["syllables"] = (prev.get("syllables") or []) + (seg.get("syllables") or [])
+                        changed = True
+                    else:
+                        new_out.append(seg)
+                out = new_out
+        return out
 
     def _split_one_segment(
         self,

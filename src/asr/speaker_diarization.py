@@ -43,6 +43,11 @@ class SpeakerDiarizer:
         self.retry_split_min_segments = int(config.get("retry_split_min_segments", 2))
         # spectral=频谱+F0(对音色更敏感); wav2vec2=情感模型骨干(易抹平说话人差异)
         self.embedding_backend = config.get("embedding", "spectral")
+        # 双人对话: 静音轮次交替校正 (A-B-A-B), 纠正聚类错标
+        self.turn_taking_correct = bool(config.get("turn_taking_correct", True))
+        self.turn_gap_seconds = float(config.get("turn_gap_seconds", 0.35))
+        self.prefer_f0 = bool(config.get("prefer_f0", True))
+        self.f0_min_spread_hz = float(config.get("f0_min_spread_hz", 15.0))
         self._w2v = None
         self._processor = None
         self.last_meta: Dict = {
@@ -108,8 +113,16 @@ class SpeakerDiarizer:
         # 2) 离线聚类回退
         if labels is None:
             if self.engine in ("auto", "pyannote", "wav2vec2_cluster", "cluster"):
-                labels = self._cluster_segments(audio, sr, segments, embedding_fn)
-                backend = "wav2vec2_cluster"
+                # 双人期望时优先 F0 二分 (对男女/高低音更稳)
+                target_spk = max(self.min_speakers, self.expected_speakers)
+                if target_spk == 2 and n >= 2:
+                    f0_labels = self._cluster_by_f0(audio, sr, segments)
+                    if f0_labels is not None and len(set(f0_labels)) >= 2:
+                        labels = f0_labels
+                        backend = "f0_kmeans"
+                if labels is None:
+                    labels = self._cluster_segments(audio, sr, segments, embedding_fn)
+                    backend = "wav2vec2_cluster" if self.embedding_backend == "wav2vec2" else "spectral_cluster"
             else:
                 labels = ["SPEAKER_00"] * n
                 backend = "forced_single"
@@ -160,20 +173,41 @@ class SpeakerDiarizer:
                 "建议: 安装/缓存 pyannote, 或调低 distance_threshold / 提高 expected_speakers"
             )
 
+        # O3: 双人对话轮次校正 (静音切轮 + F0/交替)
+        corrected = False
+        if (
+            self.turn_taking_correct
+            and target_spk == 2
+            and n >= 2
+            and backend != "pyannote"
+        ):
+            fixed = self._correct_turn_taking(audio, sr, segments, labels)
+            if fixed is not None and fixed != labels:
+                n_before = len(set(labels))
+                labels = fixed
+                n_spk = len(set(labels))
+                backend = f"{backend}+turn_correct"
+                corrected = True
+                logger.info(
+                    f"[diarization] 轮次校正: {n_before} -> {n_spk} speakers "
+                    f"(gap>={self.turn_gap_seconds}s)"
+                )
+
         # 规范化标签顺序
         labels = self._renumber(labels)
         n_spk = len(set(labels))
         self.last_meta = {
             "backend": backend,
             "n_speakers": n_spk,
-            "degraded": degraded,
+            "degraded": degraded and not corrected,
             "warning": warning,
             "n_segments": n,
             "distance_threshold": self.distance_threshold,
+            "turn_corrected": corrected,
         }
         logger.info(
             f"Diarization({backend}): {n_spk} speakers / {n} segments"
-            + (" [DEGRADED]" if degraded else "")
+            + (" [DEGRADED]" if degraded and not corrected else "")
         )
         return labels
 
@@ -249,6 +283,146 @@ class SpeakerDiarizer:
         except Exception as e:
             logger.warning(f"pyannote 分离失败({str(e)[:120]}), 回退离线聚类")
             return None
+
+    def _cluster_by_f0(self, audio, sr, segments) -> Optional[List[str]]:
+        """用各段中位基频做 2 均值聚类 — 适合男女/高低音双人对话"""
+        try:
+            import librosa
+        except ImportError:
+            return None
+        f0s = []
+        for seg in segments:
+            s = int(max(0.0, seg.get("start", 0.0)) * sr)
+            e = int(min(len(audio), seg.get("end", s / sr + 0.1)) * sr)
+            if e - s < int(0.3 * sr):
+                f0s.append(np.nan)
+                continue
+            y = audio[s:e].astype(np.float64)
+            try:
+                f0, _, _ = librosa.pyin(y, fmin=60, fmax=400, sr=sr)
+                f0 = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+                f0s.append(float(np.median(f0)) if len(f0) > 3 else np.nan)
+            except Exception:
+                f0s.append(np.nan)
+        valid = [f for f in f0s if not np.isnan(f)]
+        if len(valid) < 2:
+            return None
+        # 两个质心: 低 F0 / 高 F0
+        lo, hi = float(np.percentile(valid, 25)), float(np.percentile(valid, 75))
+        if hi - lo < self.f0_min_spread_hz:  # 区分度不够
+            return None
+        mid = 0.5 * (lo + hi)
+        ids = []
+        for f in f0s:
+            if np.isnan(f):
+                ids.append(0)
+            else:
+                ids.append(0 if f < mid else 1)
+        if len(set(ids)) < 2:
+            return None
+        labels = [f"SPEAKER_{i:02d}" for i in self._stable_ids(ids)]
+        logger.info(
+            f"Diarization(f0_kmeans): {len(set(labels))} speakers "
+            f"(F0 mid={mid:.0f}Hz, spread={hi-lo:.0f}Hz)"
+        )
+        return labels
+
+    def _segment_f0_medians(
+        self, audio: np.ndarray, sr: int, segments: List[Dict]
+    ) -> List[float]:
+        """各段中位基频; 失败则为 nan"""
+        try:
+            import librosa
+        except ImportError:
+            return [float("nan")] * len(segments)
+        out = []
+        for seg in segments:
+            s = int(max(0.0, seg.get("start", 0.0)) * sr)
+            e = int(min(len(audio), seg.get("end", s / sr + 0.1)) * sr)
+            if e - s < int(0.25 * sr):
+                out.append(float("nan"))
+                continue
+            y = audio[s:e].astype(np.float64)
+            try:
+                f0, _, _ = librosa.pyin(y, fmin=60, fmax=400, sr=sr)
+                f0 = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+                out.append(float(np.median(f0)) if len(f0) > 3 else float("nan"))
+            except Exception:
+                out.append(float("nan"))
+        return out
+
+    def _correct_turn_taking(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        segments: List[Dict],
+        labels: List[str],
+    ) -> Optional[List[str]]:
+        """
+        双人对话后验校正:
+        1) 按静音间隙切成「话轮」
+        2) 每轮用 F0 中位数判定高/低说话人; F0 不够则用原标签多数票
+        3) 相邻话轮若同人则强制交替 (对白假设)
+        """
+        n = len(segments)
+        if n < 2:
+            return None
+
+        # 切话轮: gap >= turn_gap_seconds 视为换人边界
+        turns: List[List[int]] = [[0]]
+        for i in range(1, n):
+            gap = float(segments[i].get("start", 0)) - float(
+                segments[i - 1].get("end", 0)
+            )
+            if gap >= self.turn_gap_seconds:
+                turns.append([i])
+            else:
+                turns[-1].append(i)
+
+        # 单轮过多段且无间隙 → 仍可按段交替 (合成样例常见)
+        if len(turns) < 2 and n >= 4:
+            turns = [[i] for i in range(n)]
+
+        if len(turns) < 2:
+            return None
+
+        f0s = self._segment_f0_medians(audio, sr, segments)
+        turn_f0 = []
+        for idxs in turns:
+            vals = [f0s[i] for i in idxs if not np.isnan(f0s[i])]
+            turn_f0.append(float(np.median(vals)) if vals else float("nan"))
+
+        valid_f0 = [f for f in turn_f0 if not np.isnan(f)]
+        use_f0 = len(valid_f0) >= 2 and (
+            max(valid_f0) - min(valid_f0) >= self.f0_min_spread_hz
+        )
+        mid = 0.5 * (min(valid_f0) + max(valid_f0)) if use_f0 else None
+
+        # 话轮级说话人 id (0/1)
+        turn_ids: List[int] = []
+        for ti, idxs in enumerate(turns):
+            if use_f0 and not np.isnan(turn_f0[ti]):
+                tid = 0 if turn_f0[ti] >= mid else 1  # 高 F0 = 0 (女声常见)
+            else:
+                # 多数票
+                votes = [labels[i] for i in idxs]
+                from collections import Counter
+                tid = 0 if Counter(votes).most_common(1)[0][0].endswith("00") else 1
+            # 相邻同人 → 强制交替
+            if turn_ids and tid == turn_ids[-1]:
+                tid = 1 - tid
+            turn_ids.append(tid)
+
+        out = list(labels)
+        for ti, idxs in enumerate(turns):
+            spk = f"SPEAKER_{turn_ids[ti]:02d}"
+            for i in idxs:
+                out[i] = spk
+
+        if len(set(out)) < 2:
+            # 纯交替兜底
+            out = [f"SPEAKER_{i % 2:02d}" for i in range(n)]
+        return out
 
     # ------------------------------------------------------------------
     # 离线聚类回退
