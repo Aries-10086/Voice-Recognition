@@ -164,8 +164,10 @@ class LLMTranslator:
             translated, backend = self._online_translate(text, target_lang)
             if self._is_bad_translation(translated, text, target_lang):
                 logger.warning(f"翻译结果不可用 (backend={backend})")
-            target_syllables = self._count_syllables(translated, target_lang)
-            length_ratio = target_syllables / max(source_syllables, 1)
+            history = [translated]
+            translated, length_ratio, target_syllables = self._constrain_length_ratio(
+                translated, source_syllables, target_lang, history
+            )
             logger.info(
                 f"Translation ({backend}): [{source_lang}->{target_lang}] "
                 f"ratio={length_ratio:.2f}"
@@ -180,7 +182,7 @@ class LLMTranslator:
                 target_syllables=target_syllables,
                 length_ratio=length_ratio,
                 confidence=0.9 if backend.startswith(("google", "mymemory")) else 0.55,
-                refinement_history=[translated],
+                refinement_history=history,
             )
 
         chunk_size = self.config.get("chunk_size", 0)
@@ -224,9 +226,9 @@ class LLMTranslator:
                     refinement_history.append(refined)
                     translated = refined
 
-        # 计算目标音节数
-        target_syllables = self._count_syllables(translated, target_lang)
-        length_ratio = target_syllables / max(source_syllables, 1)
+        translated, length_ratio, target_syllables = self._constrain_length_ratio(
+            translated, source_syllables, target_lang, refinement_history
+        )
 
         logger.info(f"Translation: [{source_lang}->{target_lang}] emotion={emotion}, syl_ratio={length_ratio:.2f}")
 
@@ -659,6 +661,109 @@ class LLMTranslator:
             skip_special_tokens=True,
         )
         return response.strip()
+
+    def _constrain_length_ratio(
+        self,
+        translated: str,
+        source_syllables: int,
+        target_lang: str,
+        history: Optional[List[str]] = None,
+    ) -> Tuple[str, float, int]:
+        """
+        F4: 将译文音节比压到 [length_ratio_min, length_ratio_max]（默认 0.8–1.2）。
+        超长 → 去填充词 + 按音节预算截断；过短 → 轻度补连接词（英文）。
+        """
+        min_r = float(self.config.get("length_ratio_min", 0.8))
+        max_r = float(self.config.get("length_ratio_max", 1.2))
+        src = max(int(source_syllables), 1)
+        text = (translated or "").strip()
+        tgt = self._count_syllables(text, target_lang)
+        ratio = tgt / src
+        if min_r <= ratio <= max_r or not text:
+            return text, ratio, tgt
+
+        if ratio > max_r:
+            budget = max(1, int(src * max_r))
+            # 短源句保留最低可懂音节, 避免 "The listening" 类残片
+            if src < 12:
+                budget = max(budget, min(16, int(src * 1.6)))
+            compressed = self._compress_to_syllable_budget(text, budget, target_lang)
+            if history is not None and compressed != text:
+                history.append(compressed)
+            text = compressed
+            logger.info(
+                f"  length refine: shorten {ratio:.2f} → "
+                f"{self._count_syllables(text, target_lang) / src:.2f} (budget={budget})"
+            )
+        elif ratio < min_r:
+            budget = max(1, int(src * min_r))
+            expanded = self._expand_to_syllable_budget(text, budget, target_lang)
+            if history is not None and expanded != text:
+                history.append(expanded)
+            text = expanded
+            logger.info(
+                f"  length refine: lengthen {ratio:.2f} → "
+                f"{self._count_syllables(text, target_lang) / src:.2f} (budget={budget})"
+            )
+
+        tgt = self._count_syllables(text, target_lang)
+        return text, tgt / src, tgt
+
+    def _compress_to_syllable_budget(self, text: str, budget: int, lang: str) -> str:
+        """压缩译文到音节预算内。"""
+        lang_l = (lang or "").lower()
+        out = text.strip()
+        if lang_l.startswith("en") or lang_l in ("english",):
+            # 去填充 / 冗余连接
+            fillers = (
+                r"\b(indeed|actually|really|just|very|quite|basically|literally|"
+                r"that is to say|for example|in order to|kind of|sort of|"
+                r"you know|I mean|well|so that)\b[,.]?"
+            )
+            out = re.sub(fillers, " ", out, flags=re.I)
+            out = re.sub(r"\s{2,}", " ", out).strip(" ,.;")
+            # 去重复冠词/弱词串
+            out = re.sub(r"\b(the|a|an)\s+\1\b", r"\1", out, flags=re.I)
+
+        if self._count_syllables(out, lang) <= budget:
+            return out
+
+        # 按词/字截断到预算
+        if lang_l.startswith(("zh", "ja", "ko")) or bool(re.search(r"[\u4e00-\u9fff]", out)):
+            chars = list(out)
+            kept = []
+            for ch in chars:
+                kept.append(ch)
+                if self._count_syllables("".join(kept), lang) >= budget:
+                    break
+            return "".join(kept).rstrip("，。、；,.; ")
+
+        words = out.split()
+        kept = []
+        for w in words:
+            trial = " ".join(kept + [w])
+            if kept and self._count_syllables(trial, lang) > budget:
+                break
+            kept.append(w)
+        return " ".join(kept).rstrip(" ,.;") if kept else out
+
+    def _expand_to_syllable_budget(self, text: str, budget: int, lang: str) -> str:
+        """轻度拉长到音节下限；英文用短连接词循环补齐。"""
+        lang_l = (lang or "").lower()
+        out = text.strip()
+        cur = self._count_syllables(out, lang)
+        if cur >= budget:
+            return out
+        if lang_l.startswith("en") or lang_l in ("english",):
+            pads = [" yes", " now", " then", " okay", " please", " indeed"]
+            core = out.rstrip(".!?")
+            ended = out.endswith((".", "!", "?"))
+            i = 0
+            while self._count_syllables(core, lang) < budget and i < 24:
+                core = core + pads[i % len(pads)]
+                i += 1
+            return core + ("." if ended else "")
+        return out
 
     @staticmethod
     def _count_syllables(text: str, lang: str) -> int:
