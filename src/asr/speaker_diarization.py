@@ -47,7 +47,8 @@ class SpeakerDiarizer:
         self.turn_taking_correct = bool(config.get("turn_taking_correct", True))
         self.turn_gap_seconds = float(config.get("turn_gap_seconds", 0.35))
         self.prefer_f0 = bool(config.get("prefer_f0", True))
-        self.f0_min_spread_hz = float(config.get("f0_min_spread_hz", 15.0))
+        self.f0_min_spread_hz = float(config.get("f0_min_spread_hz", 12.0))
+        self.refine_by_embedding = bool(config.get("refine_by_embedding", True))
         self._w2v = None
         self._processor = None
         self.last_meta: Dict = {
@@ -55,6 +56,9 @@ class SpeakerDiarizer:
             "n_speakers": 0,
             "degraded": False,
             "warning": "",
+            "first_round_speakers": 0,
+            "used_retry": False,
+            "label_confidences": [],
         }
 
     # ------------------------------------------------------------------
@@ -110,35 +114,32 @@ class SpeakerDiarizer:
                     raise RuntimeError(msg)
                 logger.warning("[diarization] 降级到离线聚类 (效果可能较差)")
 
-        # 2) 离线聚类回退
+        # 2) 离线聚类回退 — 多候选择优 (F1: 减少首轮塌缩与 retry)
         if labels is None:
             if self.engine in ("auto", "pyannote", "wav2vec2_cluster", "cluster"):
-                # 双人期望时优先 F0 二分 (对男女/高低音更稳)
                 target_spk = max(self.min_speakers, self.expected_speakers)
-                if target_spk == 2 and n >= 2:
-                    f0_labels = self._cluster_by_f0(audio, sr, segments)
-                    if f0_labels is not None and len(set(f0_labels)) >= 2:
-                        labels = f0_labels
-                        backend = "f0_kmeans"
-                if labels is None:
-                    labels = self._cluster_segments(audio, sr, segments, embedding_fn)
-                    backend = "wav2vec2_cluster" if self.embedding_backend == "wav2vec2" else "spectral_cluster"
+                labels, backend = self._pick_offline_labeling(
+                    audio, sr, segments, embedding_fn, target_spk
+                )
             else:
                 labels = ["SPEAKER_00"] * n
                 backend = "forced_single"
 
-        n_spk = len(set(labels))
+        first_round_n_spk = len(set(labels))
+        n_spk = first_round_n_spk
         warning = ""
         degraded = backend != "pyannote"
         target_spk = max(self.min_speakers, self.expected_speakers)
+        used_retry = False
 
-        # 段数很多却仍少于期望人数 → 大声警告 + 二次拆分
+        # 段数很多却仍少于期望人数 → 二次拆分 (仅当首轮不足)
         if n_spk < target_spk and n >= max(self.retry_split_min_segments, target_spk):
             warning = (
                 f"分离仅得到 {n_spk} 人 (期望≥{target_spk}, 共 {n} 段), "
                 "疑似塌缩; 已尝试更敏感二次拆分"
             )
             logger.warning(f"[diarization] {warning}")
+            used_retry = True
             retry = self._cluster_segments(
                 audio, sr, segments, embedding_fn,
                 distance_threshold=max(0.22, self.distance_threshold * 0.5),
@@ -193,6 +194,17 @@ class SpeakerDiarizer:
                     f"(gap>={self.turn_gap_seconds}s)"
                 )
 
+        label_confidences: List[float] = []
+
+        # F2: 段级嵌入重标 + 置信度
+        if self.refine_by_embedding and n >= 2 and n_spk >= 2:
+            labels, label_confidences = self._refine_labels_by_embedding(
+                audio, sr, segments, labels, target_spk=target_spk
+            )
+            n_spk = len(set(labels))
+            if label_confidences:
+                backend = f"{backend}+embed_refine"
+
         # 规范化标签顺序
         labels = self._renumber(labels)
         n_spk = len(set(labels))
@@ -204,12 +216,186 @@ class SpeakerDiarizer:
             "n_segments": n,
             "distance_threshold": self.distance_threshold,
             "turn_corrected": corrected,
+            "first_round_speakers": first_round_n_spk,
+            "used_retry": used_retry,
+            "label_confidences": label_confidences,
         }
         logger.info(
             f"Diarization({backend}): {n_spk} speakers / {n} segments"
             + (" [DEGRADED]" if degraded and not corrected else "")
         )
         return labels
+
+    def _pick_offline_labeling(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        segments: List[Dict],
+        embedding_fn: Optional[Callable],
+        target_spk: int,
+    ) -> Tuple[List[str], str]:
+        """F1: 多离线候选 (F0 / spectral / 敏感 spectral) 择优, 减少首轮塌缩"""
+        n = len(segments)
+        candidates: List[Tuple[str, List[str]]] = []
+
+        if self.prefer_f0 and target_spk == 2 and n >= 2:
+            f0_labels = self._cluster_by_f0(audio, sr, segments)
+            if f0_labels is not None and len(set(f0_labels)) >= 2:
+                candidates.append(("f0_kmeans", f0_labels))
+
+        spec_labels = self._cluster_segments(audio, sr, segments, embedding_fn)
+        spec_name = (
+            "wav2vec2_cluster"
+            if self.embedding_backend == "wav2vec2"
+            else "spectral_cluster"
+        )
+        candidates.append((spec_name, spec_labels))
+
+        if target_spk >= 2 and len(set(spec_labels)) < target_spk:
+            sens = self._cluster_segments(
+                audio, sr, segments, embedding_fn,
+                distance_threshold=max(0.24, self.distance_threshold * 0.65),
+                force_min_speakers=target_spk,
+            )
+            candidates.append((f"{spec_name}_sensitive", sens))
+
+        best_name, best_labels = max(
+            candidates,
+            key=lambda item: self._evaluate_labeling(
+                segments, item[1], target_spk
+            ),
+        )
+        logger.info(
+            f"[diarization] 离线候选 {len(candidates)} 个, 选用 {best_name} "
+            f"({len(set(best_labels))} spk)"
+        )
+        return best_labels, best_name
+
+    def _evaluate_labeling(
+        self,
+        segments: List[Dict],
+        labels: List[str],
+        target_spk: int,
+    ) -> float:
+        """标签方案打分: 人数匹配 + 话轮交替一致性"""
+        n = len(labels)
+        if n == 0:
+            return -1.0
+        n_spk = len(set(labels))
+        score = 0.0
+        if n_spk == target_spk:
+            score += 3.0
+        elif n_spk >= 2:
+            score += 1.5
+        else:
+            score -= 2.0
+        # 惩罚过多簇
+        if n_spk > target_spk + 1:
+            score -= 0.5 * (n_spk - target_spk)
+        # 话轮交替: 大静音后换人加分
+        if target_spk == 2 and n >= 3:
+            switches = 0
+            same_after_gap = 0
+            for i in range(1, n):
+                gap = float(segments[i].get("start", 0)) - float(
+                    segments[i - 1].get("end", 0)
+                )
+                if labels[i] != labels[i - 1]:
+                    switches += 1
+                elif gap >= self.turn_gap_seconds:
+                    same_after_gap += 1
+            score += min(1.5, switches * 0.25)
+            score -= same_after_gap * 0.4
+        # 标签均衡 (避免全标一人)
+        from collections import Counter
+        counts = Counter(labels)
+        if n_spk >= 2:
+            ratio = min(counts.values()) / max(counts.values())
+            score += ratio * 1.0
+        return score
+
+    def _compute_segment_embeddings(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        segments: List[Dict],
+        embedding_fn: Optional[Callable] = None,
+    ) -> np.ndarray:
+        """各 ASR 段频谱/声纹嵌入 (L2 归一化)"""
+        if embedding_fn is None:
+            embedding_fn = (
+                self._embed
+                if self.embedding_backend == "wav2vec2"
+                else self._spectral
+            )
+        embeds = []
+        for seg in segments:
+            s = int(max(0.0, seg.get("start", 0.0)) * sr)
+            e = int(min(len(audio), seg.get("end", s / sr + 0.1)) * sr)
+            min_len = int(0.8 * sr)
+            if e - s < min_len:
+                pad = (min_len - (e - s)) // 2
+                s = max(0, s - pad)
+                e = min(len(audio), e + pad)
+            seg_audio = audio[s:e] if e > s else audio[: int(0.1 * sr)]
+            try:
+                emb = embedding_fn(seg_audio, sr)
+                if emb is None:
+                    emb = self._spectral(seg_audio, sr)
+            except Exception:
+                emb = self._spectral(seg_audio, sr)
+            v = np.asarray(emb, dtype=np.float32).reshape(-1)
+            norm = np.linalg.norm(v)
+            embeds.append(v / norm if norm > 1e-8 else v)
+        dim = min(e.shape[0] for e in embeds)
+        return np.vstack([e[:dim] for e in embeds]).astype(np.float32)
+
+    def _refine_labels_by_embedding(
+        self,
+        audio: np.ndarray,
+        sr: int,
+        segments: List[Dict],
+        labels: List[str],
+        target_spk: int = 2,
+    ) -> Tuple[List[str], List[float]]:
+        """
+        F2: 用段嵌入 KMeans 重标, 并输出每段 label_confidence (余弦相似度)
+        """
+        n = len(segments)
+        if n < 2:
+            return labels, [1.0] * n
+        try:
+            X = self._compute_segment_embeddings(audio, sr, segments)
+        except Exception as e:
+            logger.warning(f"[diarization] 嵌入重标跳过: {e}")
+            return labels, [0.5] * n
+
+        k = min(max(target_spk, 2), n, self.max_speakers)
+        try:
+            from sklearn.cluster import KMeans
+            km = KMeans(n_clusters=k, random_state=42, n_init=10)
+            ids = km.fit_predict(X)
+            centers = km.cluster_centers_.astype(np.float32)
+            norms = np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8
+            centers = centers / norms
+            confidences = []
+            for i in range(n):
+                sims = centers @ X[i]
+                confidences.append(float(np.max(sims)))
+            new_labels = [f"SPEAKER_{i:02d}" for i in self._stable_ids(ids)]
+            # 与话轮校正结果融合: 大静音边界处优先保留交替
+            if self.turn_taking_correct and k == 2 and n >= 3:
+                turn_fixed = self._correct_turn_taking(audio, sr, segments, new_labels)
+                if turn_fixed is not None:
+                    new_labels = turn_fixed
+            avg_conf = float(np.mean(confidences)) if confidences else 0.0
+            logger.info(
+                f"[diarization] 嵌入重标: k={k}, avg_conf={avg_conf:.2f}"
+            )
+            return new_labels, confidences
+        except Exception as e:
+            logger.warning(f"[diarization] KMeans 重标失败: {e}")
+            return labels, [0.5] * n
 
     # ------------------------------------------------------------------
     # pyannote
@@ -442,24 +628,30 @@ class SpeakerDiarizer:
             else:
                 embedding_fn = self._spectral
 
-        embeds = []
-        for seg in segments:
-            s = int(max(0.0, seg.get("start", 0.0)) * sr)
-            e = int(min(len(audio), seg.get("end", s / sr + 0.1)) * sr)
-            # 过短段向两侧扩展, 提高嵌入稳定性
-            min_len = int(0.8 * sr)
-            if e - s < min_len:
-                pad = (min_len - (e - s)) // 2
-                s = max(0, s - pad)
-                e = min(len(audio), e + pad)
-            seg_audio = audio[s:e] if e > s else audio[: int(0.1 * sr)]
-            try:
-                emb = embedding_fn(seg_audio, sr)
-                if emb is None:
+        try:
+            X = self._compute_segment_embeddings(
+                audio, sr, segments, embedding_fn=embedding_fn
+            )
+        except Exception:
+            embeds = []
+            for seg in segments:
+                s = int(max(0.0, seg.get("start", 0.0)) * sr)
+                e = int(min(len(audio), seg.get("end", s / sr + 0.1)) * sr)
+                min_len = int(0.8 * sr)
+                if e - s < min_len:
+                    pad = (min_len - (e - s)) // 2
+                    s = max(0, s - pad)
+                    e = min(len(audio), e + pad)
+                seg_audio = audio[s:e] if e > s else audio[: int(0.1 * sr)]
+                try:
+                    emb = embedding_fn(seg_audio, sr)
+                    if emb is None:
+                        emb = self._spectral(seg_audio, sr)
+                except Exception:
                     emb = self._spectral(seg_audio, sr)
-            except Exception:
-                emb = self._spectral(seg_audio, sr)
-            embeds.append(np.asarray(emb, dtype=np.float32).reshape(-1))
+                embeds.append(np.asarray(emb, dtype=np.float32).reshape(-1))
+            dim = min(e.shape[0] for e in embeds)
+            X = np.vstack([e[:dim] for e in embeds]).astype(np.float32)
 
         thresh = (
             self.distance_threshold
@@ -467,7 +659,7 @@ class SpeakerDiarizer:
             else float(distance_threshold)
         )
         cluster_ids = self._cluster(
-            embeds,
+            [X[i] for i in range(len(X))],
             distance_threshold=thresh,
             force_min_speakers=max(force_min_speakers, self.min_speakers),
         )
