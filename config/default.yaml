@@ -59,6 +59,9 @@ translation:
   temperature: 0.3
   max_tokens: 512
   emotion_weight: 0.3
+  # F4: 音节长度比约束 (目标/源)
+  length_ratio_min: 0.8
+  length_ratio_max: 1.2
 
 # ---------- 发音开闭感知 & 时间轴对齐 ----------
 alignment:
@@ -98,10 +101,14 @@ synthesis:
   require_clone_engine: true
   allow_edge_fallback: true
   qwen3_tts:
-    # 1.7B-Base: 支持语音克隆(声纹复刻) + 高质量
-    # (注: CustomVoice 不支持 generate_voice_clone, 只能预设音色, 无法克隆源说话人)
+    # F5 (2026-08-28): Mac/MPS 实测对比见 outputs/f5_compare/report.md
+    # 0.6B: load≈14s clone≈10s mfcc_sim≈0.994 — 默认保速
+    # 1.7B: load≈19s clone≈13s mfcc_sim≈0.986 — 像度代理未优于 0.6B, 略慢
+    # 若 GPU/听感 MOS 明显更好可改: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    # (注: CustomVoice 不支持 generate_voice_clone, 只能预设音色)
     model_name: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     sample_rate: 24000
+    # 备选: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
   cosyvoice2:
     # 更优的零样本跨语种克隆模型 (需先下载权重, 见 README)
     # Mac/跨平台: 优先用项目内 ./models/ ; Windows 可改绝对路径
@@ -146,7 +153,8 @@ pipeline:
     fallback_on_pyannote_fail: true
     embedding: "spectral"       # spectral(推荐)/wav2vec2 — 勿用情感嵌入做分人
     prefer_f0: true             # 双人优先 F0 高低音二分
-    f0_min_spread_hz: 15.0      # F0 高低差阈值 (Hz)
+    f0_min_spread_hz: 12.0     # F0 高低差阈值 (Hz); 合成音可略降
+    refine_by_embedding: true   # F2: KMeans 段级重标 + label_confidence
     turn_taking_correct: true   # O3: 静音轮次 + 交替校正
     turn_gap_seconds: 0.35      # 超过该静音视为换人话轮
 
@@ -163,3 +171,8 @@ pipeline:
     emotion_bucket: true        # 情感粗分桶, 减少抖动误切组
     chunk_max_chars: 250        # 整段话切块的最大字符数 (避免长句生成中断)
     chunk_max_sentences: 3      # 整段话切块的最大句数
+    # F4: 合成时长对齐源语 (±20%)
+    match_group_duration: true  # 每组克隆后 time-stretch 到源组覆盖时长
+    match_output_duration: true # 整轨输出压到源时长的 0.8–1.2 倍
+    duration_ratio_min: 0.8
+    duration_ratio_max: 1.2
