@@ -238,9 +238,16 @@ class CrossLingualPipeline:
                     seg_speakers = self.diarizer.diarize(
                         audio, sr, result.asr_result.segments, embedding_fn=None
                     )
-                    for seg, spk in zip(result.asr_result.segments, seg_speakers):
+                    result.diarization_meta = dict(
+                        getattr(self.diarizer, "last_meta", {}) or {}
+                    )
+                    confs = result.diarization_meta.get("label_confidences") or []
+                    for i, (seg, spk) in enumerate(
+                        zip(result.asr_result.segments, seg_speakers)
+                    ):
                         seg["speaker"] = spk
-                    result.diarization_meta = dict(getattr(self.diarizer, "last_meta", {}) or {})
+                        if i < len(confs):
+                            seg["label_confidence"] = round(float(confs[i]), 3)
                 else:
                     for seg in result.asr_result.segments:
                         seg["speaker"] = "SPEAKER_00"
@@ -825,6 +832,7 @@ class CrossLingualPipeline:
                      f"ASR 分段数: {len(segments)}",
                      f"说话人数: {n_spk}",
                      f"分离后端: {diar.get('backend', '?')} | degraded={diar.get('degraded', '?')}",
+                     f"首轮说话人数: {diar.get('first_round_speakers', '?')} | retry={diar.get('used_retry', '?')}",
                      f"克隆引擎: {clone.get('engine', '?')} | supports_clone={clone.get('supports_voice_clone', '?')}",
                      f"整体情感: {emotion}",
                      f"克隆分组数: {len(groups)}"]
@@ -873,6 +881,7 @@ class CrossLingualPipeline:
                 )
                 json_segs.append({
                     "index": i + 1, "speaker": spk,
+                    "label_confidence": seg.get("label_confidence"),
                     "start": round(start, 3), "end": round(end, 3),
                     "onset": round(onset, 3), "offset": round(offset, 3),
                     "emotion": emo,
@@ -1029,6 +1038,15 @@ class CrossLingualPipeline:
             ref_audio, ref_text, _meta = speaker_ref_cache[spk]
 
             try:
+                # 源组覆盖时长, 用于语速对齐 (F4 / B3)
+                g0 = group["segs"][0]
+                g1 = group["segs"][-1]
+                src_dur = float(
+                    g1.get("offset", g1.get("end", 0))
+                    - g0.get("onset", g0.get("start", 0))
+                )
+                per_chunk = (src_dur / max(len(chunks), 1)) if src_dur > 0.3 else None
+
                 if use_batch:
                     if spk not in speaker_prompt_cache:
                         speaker_prompt_cache[spk] = self.voice_cloner.prepare_speaker_prompt(
@@ -1042,14 +1060,6 @@ class CrossLingualPipeline:
                     wavs = [w.astype(np.float32) for w in wavs if w is not None and len(w) > 0]
                 else:
                     wavs = []
-                    # 源组覆盖时长, 用于轻量语速对齐 (B3, 仅真克隆引擎时启用)
-                    g0 = group["segs"][0]
-                    g1 = group["segs"][-1]
-                    src_dur = float(
-                        g1.get("offset", g1.get("end", 0))
-                        - g0.get("onset", g0.get("start", 0))
-                    )
-                    per_chunk = (src_dur / max(len(chunks), 1)) if src_dur > 0.3 else None
                     for c in chunks:
                         cl = self.voice_cloner.clone(
                             text=c, reference_audio=ref_audio, reference_sample_rate=sr,
@@ -1061,6 +1071,18 @@ class CrossLingualPipeline:
                         wavs.append(cl.audio.astype(np.float32))
                 # 轻微峰值归一, 降低组间响度跳变
                 group_audio = self._crossfade_concat(wavs, clone_sr, crossfade_ms)
+                # F4: 批处理路径也按源组时长 time-stretch
+                match_group = bool(seg_cfg.get("match_group_duration", True))
+                if (
+                    match_group and supports_clone and src_dur > 0.3
+                    and len(group_audio) > 0
+                ):
+                    from src.synthesis.tts_engine import TTSEngine
+                    cur_g = len(group_audio) / clone_sr
+                    if abs(cur_g - src_dur) / src_dur > 0.05:
+                        group_audio = TTSEngine._stretch_to_duration(
+                            group_audio, clone_sr, src_dur
+                        )
                 peak = float(np.max(np.abs(group_audio))) if len(group_audio) else 0.0
                 if peak > 1e-6:
                     group_audio = group_audio / peak * 0.95
@@ -1088,6 +1110,22 @@ class CrossLingualPipeline:
         mv = float(np.abs(full).max()) if len(full) else 0.0
         if mv > 1.0:
             full = full / mv * 0.98
+        # F4: 整轨输出压到源时长的 duration_ratio_min–max
+        match_out = bool(seg_cfg.get("match_output_duration", True))
+        src_d = float(result.source_duration or 0.0)
+        if match_out and supports_clone and src_d > 0.5 and len(full) > 0:
+            from src.synthesis.tts_engine import TTSEngine
+            d_min = float(seg_cfg.get("duration_ratio_min", 0.8))
+            d_max = float(seg_cfg.get("duration_ratio_max", 1.2))
+            out_d = len(full) / clone_sr
+            lo, hi = src_d * d_min, src_d * d_max
+            if out_d > hi or out_d < lo:
+                target_d = float(np.clip(out_d, lo, hi))
+                logger.info(
+                    f"   duration match: {out_d:.1f}s → {target_d:.1f}s "
+                    f"(src={src_d:.1f}s, band=[{d_min:.2f},{d_max:.2f}])"
+                )
+                full = TTSEngine._stretch_to_duration(full, clone_sr, target_d)
         # 尾部收束
         fade_ms = float(seg_cfg.get("fade_ms", 12))
         tail = int(clone_sr * max(fade_ms, 8) / 1000.0)
