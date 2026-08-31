@@ -217,7 +217,10 @@ class CrossLingualPipeline:
             t1 = time.time()
             logger.info("[1/7] Loading audio...")
             audio, sr = AudioUtils.load_audio(audio_path)
-            audio = AudioUtils.trim_silence(audio, sr)
+            gold = self._load_gold_transcript(audio_path)
+            # 有金标时不要 trim_silence, 否则时间轴与 gold 错位; 且可能裁掉首句
+            if gold is None:
+                audio = AudioUtils.trim_silence(audio, sr)
             result.source_audio, result.source_sr = audio, sr
             result.source_duration = len(audio) / sr
             times["load"] = time.time() - t1
@@ -227,14 +230,29 @@ class CrossLingualPipeline:
             logger.info("[2/7] ASR + Emotion + Diarization...")
 
             if self.asr is not None:
-                # ASR (whisper内置语种检测, 跳过额外LID模型加速)
-                result.asr_result = self.asr.transcribe(audio, sr)
-                result.detected_language = result.asr_result.language
-                logger.info(f"   lang: {result.detected_language}")
+                # 可选金标旁路: 同名 .gold.json 存在则跳过 ASR 文本 (仍用时间戳)
+                if gold is not None:
+                    result.asr_result = gold
+                    result.detected_language = gold.language or "zh"
+                    logger.info(f"   lang: {result.detected_language} (gold transcript)")
+                else:
+                    result.asr_result = self.asr.transcribe(audio, sr)
+                    result.detected_language = result.asr_result.language
+                    logger.info(f"   lang: {result.detected_language}")
 
                 # 说话人分离 (识别不同人声; pyannote 不可用时离线聚类兜底 + 明确降级提示)
                 # 注意: 不要复用情感嵌入做说话人聚类 (情感空间会抹平音色差异)
-                if self.diarizer is not None:
+                gold_has_spk = all(s.get("speaker") for s in result.asr_result.segments)
+                if gold_has_spk and gold is not None:
+                    result.diarization_meta = {
+                        "backend": "gold",
+                        "n_speakers": len({s["speaker"] for s in result.asr_result.segments}),
+                        "degraded": False,
+                        "first_round_speakers": len({s["speaker"] for s in result.asr_result.segments}),
+                        "used_retry": False,
+                    }
+                    logger.info("   diarization: using gold speaker labels")
+                elif self.diarizer is not None:
                     seg_speakers = self.diarizer.diarize(
                         audio, sr, result.asr_result.segments, embedding_fn=None
                     )
@@ -283,49 +301,80 @@ class CrossLingualPipeline:
                 emo = result.emotion_result.emotion if result.emotion_result else "neutral"
                 emo_i = result.emotion_result.intensity if result.emotion_result else 0.5
                 emo_v = result.emotion_result.valence if result.emotion_result else 0.0
-                # F7: 短句合并后再译 (同说话人、短间隔)
+                # O1: 超短 ASR 碎屑并入前一段文本, 再 F7 合并译
+                self._glue_asr_crumbs(result.asr_result.segments)
                 merge_groups = self._merge_short_segments_for_translation(
                     result.asr_result.segments
                 )
                 tgt_parts = []
                 ok_n = 0
+                group_tgts = []  # 与 merge_groups 对齐, 供空译文二次合并重试
                 for idxs in merge_groups:
                     segs = [result.asr_result.segments[i] for i in idxs]
                     src = "".join((s.get("text") or "").strip() for s in segs).strip()
                     if not src:
                         for s in segs:
                             s["tgt"] = ""
+                        group_tgts.append("")
                         continue
                     seg_emo = segs[0].get("emotion", emo)
-                    try:
-                        tr = self.translator.translate(
-                            text=src,
-                            source_lang=src_lang,
-                            target_lang=target_lang,
-                            emotion=seg_emo,
-                            emotion_intensity=emo_i,
-                            emotion_valence=emo_v,
-                            refine=False,
-                        )
-                        tgt = (tr.translated_text or "").strip()
-                        if self.translator._is_bad_translation(tgt, src, target_lang):
-                            demo = self.translator._demo_phrase_translate(src, target_lang)
-                            tgt = (demo or "").strip()
-                    except Exception as e:
-                        logger.warning(f"  seg translate fail: {e}")
-                        demo = self.translator._demo_phrase_translate(src, target_lang)
-                        tgt = (demo or "").strip()
+                    tgt = self._translate_segment_text(
+                        src, src_lang, target_lang, seg_emo, emo_i, emo_v
+                    )
                     # 译文挂在合并组首段, 其余置空 (合成时 _join_with_pauses 会拼起来)
                     for j, s in enumerate(segs):
                         s["tgt"] = tgt if j == 0 else ""
                         s["translate_merged"] = len(idxs) > 1
+                    group_tgts.append(tgt)
                     if tgt:
                         ok_n += len(idxs)
                         tgt_parts.append(tgt)
+
+                # O2: 空译文组与下一同说话人组合并再译一次
+                retry_n = self._retry_empty_translations(
+                    result.asr_result.segments,
+                    merge_groups,
+                    group_tgts,
+                    src_lang,
+                    target_lang,
+                    emo,
+                    emo_i,
+                    emo_v,
+                )
+                if retry_n:
+                    # 按组统计: 首段有 tgt 则整组算成功
+                    ok_n = 0
+                    tgt_parts = []
+                    for idxs in merge_groups:
+                        t = (result.asr_result.segments[idxs[0]].get("tgt") or "").strip()
+                        if t:
+                            ok_n += len(idxs)
+                            tgt_parts.append(t)
+                    logger.info(f"  empty-translate retry recovered {retry_n} group(s)")
+
                 joined = " ".join(t for t in tgt_parts if t)
                 # 汇总 TranslationResult: 优先用逐段拼接统计音节 (避免整段失败导致 length_ratio 失真)
                 src_syl = self.translator._count_syllables(result.asr_result.text, src_lang)
                 tgt_syl = self.translator._count_syllables(joined, target_lang) if joined else 0
+                length_ratio = tgt_syl / max(src_syl, 1)
+                # 整篇再压一次 length_ratio (段级贴边汇总后可能略超)
+                max_r = float(self.config.get("translation", {}).get("length_ratio_max", 1.2))
+                min_r = float(self.config.get("translation", {}).get("length_ratio_min", 0.8))
+                if joined and (length_ratio > max_r or length_ratio < min_r):
+                    hist = [joined]
+                    joined, length_ratio, tgt_syl = self.translator._constrain_length_ratio(
+                        joined, src_syl, target_lang, hist
+                    )
+                    # 截断后残片修补
+                    joined = self.translator._polish_after_length(
+                        result.asr_result.text, joined, target_lang
+                    )
+                    tgt_syl = self.translator._count_syllables(joined, target_lang)
+                    length_ratio = tgt_syl / max(src_syl, 1)
+                    # 写回末段 tgt 不便拆分, 仅更新汇总译文供 summary/timeline
+                    logger.info(
+                        f"  doc-level length refine → ratio={length_ratio:.2f}"
+                    )
                 from src.translation.llm_translator import TranslationResult
                 result.translation_result = TranslationResult(
                     source_text=result.asr_result.text,
@@ -335,7 +384,7 @@ class CrossLingualPipeline:
                     emotion=emo,
                     source_syllables=src_syl,
                     target_syllables=tgt_syl,
-                    length_ratio=tgt_syl / max(src_syl, 1),
+                    length_ratio=length_ratio,
                     confidence=0.85 if ok_n == len(result.asr_result.segments) else 0.6,
                     refinement_history=[joined],
                 )
@@ -502,16 +551,225 @@ class CrossLingualPipeline:
             ]
         return sentences
 
+    def _load_gold_transcript(self, audio_path: str):
+        """
+        若存在同名 .gold.json, 用金标文本(+可选时间戳)旁路 ASR。
+        格式: {"language":"zh","segments":[{"start":0,"end":2,"text":"...","speaker":"SPEAKER_00"}]}
+        """
+        from pathlib import Path
+        import json
+        p = Path(audio_path)
+        gold_path = p.with_suffix(".gold.json")
+        if not gold_path.exists():
+            # 也认 data/foo.wav → data/foo.gold.json 已覆盖; 再试 .transcript.gold.json
+            alt = p.parent / f"{p.stem}.gold.json"
+            gold_path = alt if alt.exists() else gold_path
+        if not gold_path.exists():
+            return None
+        try:
+            data = json.loads(gold_path.read_text(encoding="utf-8"))
+            segs = data.get("segments") or []
+            if not segs:
+                return None
+            from src.asr.whisper_asr import ASRResult
+            norm = []
+            for s in segs:
+                text = (s.get("text") or "").strip()
+                if not text:
+                    continue
+                item = {
+                    "start": float(s.get("start", 0)),
+                    "end": float(s.get("end", s.get("start", 0) + 1)),
+                    "text": text,
+                    "words": s.get("words") or [],
+                    "syllables": s.get("syllables") or [],
+                }
+                if s.get("speaker"):
+                    item["speaker"] = s["speaker"]
+                norm.append(item)
+            if not norm:
+                return None
+            text = " ".join(x["text"] for x in norm)
+            dur = max(x["end"] for x in norm)
+            logger.info(f"   gold transcript: {gold_path.name} ({len(norm)} segs)")
+            return ASRResult(
+                text=text,
+                language=data.get("language") or "zh",
+                segments=norm,
+                duration=dur,
+                confidence=1.0,
+            )
+        except Exception as e:
+            logger.warning(f"gold transcript load fail: {e}")
+            return None
+
+    def _translate_segment_text(
+        self, src, src_lang, target_lang, seg_emo, emo_i, emo_v
+    ) -> str:
+        """单段/合并组翻译; 失败或坏译时回落短语表。"""
+        if not src or self.translator is None:
+            return ""
+        try:
+            tr = self.translator.translate(
+                text=src,
+                source_lang=src_lang,
+                target_lang=target_lang,
+                emotion=seg_emo,
+                emotion_intensity=emo_i,
+                emotion_valence=emo_v,
+                refine=False,
+            )
+            tgt = (tr.translated_text or "").strip()
+            if self.translator._is_bad_translation(tgt, src, target_lang):
+                demo = self.translator._demo_phrase_translate(src, target_lang)
+                tgt = (demo or "").strip()
+            return tgt
+        except Exception as e:
+            logger.warning(f"  seg translate fail: {e}")
+            demo = self.translator._demo_phrase_translate(src, target_lang)
+            return (demo or "").strip()
+
+    @staticmethod
+    def _is_asr_crumb(text: str, crumb_max: int = 4) -> bool:
+        """超短残片: 纯英文尾巴 (ory) / 极少汉字碎屑。"""
+        t = re.sub(r"\s+", "", (text or "")).strip(".,;:!?，。、；：！？…")
+        if not t:
+            return True
+        if len(t) <= crumb_max:
+            return True
+        # 无汉字且极短英文词块
+        if not re.search(r"[\u4e00-\u9fff]", t) and len(t) <= crumb_max + 2:
+            return True
+        return False
+
+    def _glue_asr_crumbs(self, segments: list) -> None:
+        """
+        O1: 将超短 ASR 碎屑文本拼到前一同说话人「有文本」段 (时间戳不变)。
+        避免 "CD我的" / "ory" 单独送翻失败; 跳过已清空的中间壳段。
+        """
+        if not segments:
+            return
+        asr_cfg = self.config.get("asr", {})
+        crumb_max = int(asr_cfg.get("crumb_max_chars", 4))
+        gap_th = float(asr_cfg.get("merge_gap_seconds", 0.5))
+        i = 1
+        while i < len(segments):
+            seg = segments[i]
+            text = (seg.get("text") or "").strip()
+            if not self._is_asr_crumb(text, crumb_max):
+                i += 1
+                continue
+            spk = seg.get("speaker")
+            # 回溯到最近同说话人且仍有文本的段
+            j = i - 1
+            anchor = None
+            while j >= 0:
+                prev = segments[j]
+                if prev.get("speaker") != spk:
+                    break
+                gap = float(seg.get("start", 0)) - float(prev.get("end", 0))
+                if gap > gap_th + 0.3:
+                    break
+                if (prev.get("text") or "").strip():
+                    anchor = j
+                    break
+                j -= 1
+            if anchor is None:
+                i += 1
+                continue
+            prev = segments[anchor]
+            prev["text"] = ((prev.get("text") or "").rstrip() + text).strip()
+            seg["text"] = ""
+            prev["end"] = max(float(prev.get("end", 0)), float(seg.get("end", 0)))
+            if "offset" in prev or "offset" in seg:
+                prev["offset"] = max(
+                    float(prev.get("offset", prev.get("end", 0))),
+                    float(seg.get("offset", seg.get("end", 0))),
+                )
+            i += 1
+
+    def _retry_empty_translations(
+        self,
+        segments,
+        merge_groups,
+        group_tgts,
+        src_lang,
+        target_lang,
+        emo,
+        emo_i,
+        emo_v,
+    ) -> int:
+        """
+        O2: 空译文组合并下一同说话人组再译; 成功则写回首段。
+        返回恢复的组数。
+        """
+        recovered = 0
+        n = len(merge_groups)
+        i = 0
+        while i < n:
+            if (group_tgts[i] or "").strip():
+                i += 1
+                continue
+            idxs = merge_groups[i]
+            if not idxs:
+                i += 1
+                continue
+            spk = segments[idxs[0]].get("speaker")
+            # 向后找同说话人组 (可吞连续空组 + 一个非空组)
+            j = i + 1
+            bundle = list(idxs)
+            while j < n:
+                nxt = merge_groups[j]
+                if not nxt:
+                    j += 1
+                    continue
+                if segments[nxt[0]].get("speaker") != spk:
+                    break
+                bundle.extend(nxt)
+                # 吃掉一个已有译文组后停止, 避免无限吞并
+                if (group_tgts[j] or "").strip():
+                    j += 1
+                    break
+                j += 1
+            if len(bundle) <= len(idxs):
+                i += 1
+                continue
+            src = "".join(
+                (segments[k].get("text") or "").strip() for k in bundle
+            ).strip()
+            if not src:
+                i += 1
+                continue
+            seg_emo = segments[bundle[0]].get("emotion", emo)
+            tgt = self._translate_segment_text(
+                src, src_lang, target_lang, seg_emo, emo_i, emo_v
+            )
+            if not tgt:
+                i += 1
+                continue
+            # 清空 bundle 内旧 tgt, 写到首段
+            for k in bundle:
+                segments[k]["tgt"] = ""
+                segments[k]["translate_merged"] = True
+            segments[bundle[0]]["tgt"] = tgt
+            for g in range(i, j):
+                group_tgts[g] = tgt if g == i else ""
+            recovered += 1
+            i = j if j > i else i + 1
+        return recovered
+
     def _merge_short_segments_for_translation(self, segments: list) -> list:
         """
         F7: 同说话人、短间隔、短文本的相邻段合并后再译。
         返回索引组列表, 例如 [[0], [1,2], [3]]。
+        O1: 碎屑段强制可合并; 空文本段并入前组。
         """
         if not segments:
             return []
         asr_cfg = self.config.get("asr", {})
         gap_th = float(asr_cfg.get("merge_gap_seconds", 0.35))
         short_chars = int(asr_cfg.get("merge_short_chars", 8))
+        crumb_max = int(asr_cfg.get("crumb_max_chars", 4))
         groups = []
         cur = [0]
         for i in range(1, len(segments)):
@@ -519,12 +777,23 @@ class CrossLingualPipeline:
             prev_spk = prev.get("speaker", "SPEAKER_00")
             spk = seg.get("speaker", "SPEAKER_00")
             gap = float(seg.get("start", 0)) - float(prev.get("end", 0))
-            prev_len = len(re.sub(r"\s", "", (prev.get("text") or "")))
-            seg_len = len(re.sub(r"\s", "", (seg.get("text") or "")))
+            prev_text = (prev.get("text") or "").strip()
+            seg_text = (seg.get("text") or "").strip()
+            prev_len = len(re.sub(r"\s", "", prev_text))
+            seg_len = len(re.sub(r"\s", "", seg_text))
+            crumb = self._is_asr_crumb(seg_text, crumb_max) or self._is_asr_crumb(
+                prev_text, crumb_max
+            )
+            empty_seg = not seg_text
             can_merge = (
                 prev_spk == spk
                 and gap <= gap_th
-                and (prev_len <= short_chars or seg_len <= short_chars)
+                and (
+                    empty_seg
+                    or crumb
+                    or prev_len <= short_chars
+                    or seg_len <= short_chars
+                )
             )
             if can_merge:
                 cur.append(i)

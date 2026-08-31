@@ -16,12 +16,16 @@ asr:
   model_name: "medium"            # CPU 友好; GPU 可改 large-v3
   compute_type: "int8"
   device: "cpu"                   # cuda / cpu (run_pipeline --device 会覆盖)
-  beam_size: 1                    # 1=greedy 最快; 2=略慢略准
+  beam_size: 3                    # 真实样例提准; 演示可改回 1 加速
   num_workers: 1                  # 传给 WhisperModel 构造函数 (GPU 建议 1)
   cpu_threads: 0                  # CPU 推理线程数 (0=自动)
   language: "zh"
   word_timestamps: true
   condition_on_previous_text: false
+  temperature: 0.0
+  # 领域提示: 只声明场景, 不要写具体主题句 (否则弱音/嘈杂时 Whisper 会整段复读提示词)
+  # 反例: 「讨论科技、气候、河流与历史」曾导致千夏等人声被幻觉成该句循环
+  initial_prompt: "这是一段中文口语对话，请准确转写说话内容。"
   vad_filter: true
   min_silence_ms: 250             # VAD 静音阈值, 越小切段越碎
   speech_pad_ms: 120
@@ -30,9 +34,19 @@ asr:
   max_segment_seconds: 2.8
   min_segment_seconds: 0.45
   # 碎句合并: 修复「還分|太清」「把說|話人」等半句切开
-  merge_gap_seconds: 0.35
+  # O1 (2026-08-31): 略放宽 — 歌词/口述碎段 (如 "ory"/"CD我的") 更易粘合再译
+  merge_gap_seconds: 0.50
   merge_max_seconds: 4.8
-  merge_short_chars: 8
+  merge_short_chars: 12
+  # 超短碎屑 (纯英文尾巴/残片) 强制并入前一段的最大字数
+  crumb_max_chars: 4
+  # ASR 后校正 (明确误识对)
+  corrections:
+    - ["水保护", "水管"]
+    - ["水保護", "水管"]
+    - ["不可预测的风景", "不可预测的气候"]
+    - ["不可預測的風景", "不可预测的气候"]
+  hotwords: ["说话人分离", "语音克隆", "水管", "气候"]
   # FunASR 配置
   funasr_model: "iic/SenseVoiceSmall"
   vad_model: "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
@@ -61,7 +75,7 @@ translation:
   emotion_weight: 0.3
   # F4: 音节长度比约束 (目标/源)
   length_ratio_min: 0.8
-  length_ratio_max: 1.2
+  length_ratio_max: 1.15          # 略收紧, 避免段级贴边汇总后 >1.2
 
 # ---------- 发音开闭感知 & 时间轴对齐 ----------
 alignment:
@@ -172,9 +186,10 @@ pipeline:
     chunk_max_chars: 250        # 整段话切块的最大字符数 (避免长句生成中断)
     chunk_max_sentences: 3      # 整段话切块的最大句数
     # F4: 合成时长对齐源语 (±20%)
+    # O3 (2026-08-31): 下限 0.90 — 译文偏短时整轨上拉, 避免 0.82 级明显缩水
     match_group_duration: true  # 每组克隆后 time-stretch 到源组覆盖时长
-    match_output_duration: true # 整轨输出压到源时长的 0.8–1.2 倍
-    duration_ratio_min: 0.8
+    match_output_duration: true # 整轨输出压到源时长的 0.9–1.2 倍
+    duration_ratio_min: 0.90
     duration_ratio_max: 1.2
     # F6: 组间停顿对齐源语静音
     align_source_gaps: true

@@ -147,6 +147,11 @@ class WhisperASR:
             "min_silence_duration_ms": int(self.config.get("min_silence_ms", 250)),
             "speech_pad_ms": int(self.config.get("speech_pad_ms", 120)),
         }
+        initial_prompt = self.config.get("initial_prompt") or None
+        # 真实中文样例: 领域提示降低幻觉; 空字符串视为未设置
+        if isinstance(initial_prompt, str) and not initial_prompt.strip():
+            initial_prompt = None
+        temperature = self.config.get("temperature", 0.0)
         transcribe_kwargs = dict(
             language=lang,
             beam_size=beam_size,
@@ -154,29 +159,33 @@ class WhisperASR:
             vad_parameters=vad_params if vad_filter else None,
             word_timestamps=word_ts,       # 启用词级时间戳 → 音节对齐
             condition_on_previous_text=cond_prev,
+            initial_prompt=initial_prompt,
+            temperature=temperature if temperature is not None else 0.0,
         )
         # 去掉 None 值, 兼容旧版 faster-whisper
         transcribe_kwargs = {k: v for k, v in transcribe_kwargs.items() if v is not None}
         try:
             segments_raw, info = self.model.transcribe(audio, **transcribe_kwargs)
         except TypeError:
-            # 旧版不支持 vad_parameters
-            transcribe_kwargs.pop("vad_parameters", None)
+            # 旧版不支持 vad_parameters / initial_prompt
+            for drop in ("vad_parameters", "initial_prompt", "temperature"):
+                transcribe_kwargs.pop(drop, None)
             segments_raw, info = self.model.transcribe(audio, **transcribe_kwargs)
 
         segments = []
         full_text = []
         for seg in segments_raw:
+            text = self._postcorrect_asr_text(seg.text.strip())
             segments.append({
                 "start": seg.start,
                 "end": seg.end,
-                "text": seg.text.strip(),
+                "text": text,
                 "words": [
                     {"word": w.word, "start": w.start, "end": w.end, "probability": w.probability}
                     for w in (seg.words or [])
                 ],
             })
-            full_text.append(seg.text.strip())
+            full_text.append(text)
 
         # 新版 faster-whisper 移除了 avg_log_prob, 用 language_probability 替代
         confidence = getattr(info, 'avg_log_prob', None)
@@ -201,6 +210,40 @@ class WhisperASR:
         )
         logger.info(f"ASR: lang={result.language}, segs={len(segments)}, text={result.text[:100]}...")
         return result
+
+    def _postcorrect_asr_text(self, text: str) -> str:
+        """
+        轻量 ASR 后校正: 配置 hotwords / 常见误识对。
+        不改变语义结构, 只做明确替换。
+        """
+        if not text:
+            return text
+        out = text
+        # 默认常见误识 (可被 config.asr.corrections 覆盖/追加)
+        pairs = [
+            ("水保护", "水管"),
+            ("水保護", "水管"),
+            ("淹水系统", "排水系统"),
+            ("淹水系統", "排水系统"),
+            ("不可预测的风景", "不可预测的气候"),
+            ("不可預測的風景", "不可预测的气候"),
+            ("风的风景", "气候"),
+            ("風的風景", "气候"),
+        ]
+        extra = self.config.get("corrections") or []
+        for item in extra:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                pairs.append((str(item[0]), str(item[1])))
+            elif isinstance(item, dict) and "from" in item and "to" in item:
+                pairs.append((str(item["from"]), str(item["to"])))
+        for a, b in pairs:
+            if a and a in out:
+                out = out.replace(a, b)
+        hotwords = self.config.get("hotwords") or []
+        # hotwords 仅作提示日志, Whisper 无原生热词; 保留配置位
+        if hotwords and out != text:
+            logger.debug(f"ASR postcorrect: {text[:40]} -> {out[:40]}")
+        return out
 
     def _refine_segments(
         self, audio: np.ndarray, sr: int, segments: List[Dict]
