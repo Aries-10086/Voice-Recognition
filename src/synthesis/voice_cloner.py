@@ -261,6 +261,10 @@ class VoiceCloner:
                 reference_audio, reference_sample_rate,
                 target_duration,
             )
+            # F6: 真克隆后轻度情感韵律 hint (非仅 neutral)
+            cloned_audio = self._apply_emotion_prosody(
+                cloned_audio, tts_result.sample_rate, emotion_label
+            )
         elif engine == "edge_tts":
             # edge 已用不同说话人音色区分; 跳过 WORLD(易毁掉听感/变短)
             cloned_audio = tts_result.audio.astype(np.float32)
@@ -270,6 +274,9 @@ class VoiceCloner:
                     reference_audio, reference_sample_rate,
                     target_duration,
                 )
+            cloned_audio = self._apply_emotion_prosody(
+                cloned_audio, tts_result.sample_rate, emotion_label
+            )
         else:
             cloned_audio = self._world_voice_conversion(
                 tts_result.audio, tts_result.sample_rate,
@@ -375,6 +382,45 @@ class VoiceCloner:
         except Exception as e:
             logger.warning(f"⚠️ 克隆跳过({e})")
             return tts_audio
+
+    def _apply_emotion_prosody(
+        self, audio: np.ndarray, sr: int, emotion: str
+    ) -> np.ndarray:
+        """
+        F6: 真克隆后的轻度情感韵律 hint。
+        幅度刻意保守, 避免变调玩具感。
+        """
+        emo = (emotion or "neutral").lower()
+        if emo in ("neutral", "") or audio is None or len(audio) == 0:
+            return audio
+        try:
+            import librosa
+            # 半音 / 语速 (rate>1 加快)
+            table = {
+                "happy": (1.0, 1.04),
+                "surprised": (1.5, 1.05),
+                "positive": (0.8, 1.03),
+                "sad": (-1.2, 0.96),
+                "negative": (-1.0, 0.97),
+                "angry": (1.8, 1.06),
+                "fearful": (0.8, 1.04),
+                "disgusted": (0.5, 1.0),
+            }
+            semi, rate = table.get(emo, (0.0, 1.0))
+            out = audio.astype(np.float64)
+            if abs(semi) >= 0.3:
+                out = librosa.effects.pitch_shift(
+                    out, sr=sr, n_steps=semi, bins_per_octave=24
+                )
+            if abs(rate - 1.0) >= 0.02:
+                out = librosa.effects.time_stretch(out, rate=float(rate))
+            peak = float(np.max(np.abs(out))) if len(out) else 0.0
+            if peak > 1e-6:
+                out = out / peak * 0.95
+            return out.astype(np.float32)
+        except Exception as e:
+            logger.warning(f"emotion prosody skip: {e}")
+            return audio
 
     def _match_duration(
         self, tts_audio, tts_sr, ref_audio, ref_sr, target_duration=None,
