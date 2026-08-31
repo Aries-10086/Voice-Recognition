@@ -259,6 +259,13 @@ class CrossLingualPipeline:
 
             if self.emotion_recognizer is not None:
                 result.emotion_result = self.emotion_recognizer.recognize(audio, sr)
+            # F6: 段级情感提前到翻译前, 供措辞与后续分组
+            if self.emotion_recognizer is not None and result.asr_result is not None:
+                seg_emos = self._segment_emotions(audio, sr, result.asr_result.segments)
+                default_emo = result.emotion_result.emotion if result.emotion_result else "neutral"
+                for i, seg in enumerate(result.asr_result.segments):
+                    seg["emotion"] = seg_emos.get(i, default_emo)
+                    seg["emotion_bucket"] = self._emotion_bucket(seg["emotion"])
             times["asr+emotion"] = time.time() - t1
             n_spk = len(set(s.get("speaker","?") for s in result.asr_result.segments)) if result.asr_result else 1
             if n_spk <= 1 and result.asr_result and len(result.asr_result.segments) >= 4:
@@ -276,19 +283,26 @@ class CrossLingualPipeline:
                 emo = result.emotion_result.emotion if result.emotion_result else "neutral"
                 emo_i = result.emotion_result.intensity if result.emotion_result else 0.5
                 emo_v = result.emotion_result.valence if result.emotion_result else 0.0
+                # F7: 短句合并后再译 (同说话人、短间隔)
+                merge_groups = self._merge_short_segments_for_translation(
+                    result.asr_result.segments
+                )
                 tgt_parts = []
                 ok_n = 0
-                for seg in result.asr_result.segments:
-                    src = (seg.get("text") or "").strip()
+                for idxs in merge_groups:
+                    segs = [result.asr_result.segments[i] for i in idxs]
+                    src = "".join((s.get("text") or "").strip() for s in segs).strip()
                     if not src:
-                        seg["tgt"] = ""
+                        for s in segs:
+                            s["tgt"] = ""
                         continue
+                    seg_emo = segs[0].get("emotion", emo)
                     try:
                         tr = self.translator.translate(
                             text=src,
                             source_lang=src_lang,
                             target_lang=target_lang,
-                            emotion=seg.get("emotion", emo),
+                            emotion=seg_emo,
                             emotion_intensity=emo_i,
                             emotion_valence=emo_v,
                             refine=False,
@@ -297,17 +311,17 @@ class CrossLingualPipeline:
                         if self.translator._is_bad_translation(tgt, src, target_lang):
                             demo = self.translator._demo_phrase_translate(src, target_lang)
                             tgt = (demo or "").strip()
-                        seg["tgt"] = tgt
-                        if tgt:
-                            ok_n += 1
-                            tgt_parts.append(tgt)
                     except Exception as e:
                         logger.warning(f"  seg translate fail: {e}")
                         demo = self.translator._demo_phrase_translate(src, target_lang)
-                        seg["tgt"] = (demo or "").strip()
-                        if seg["tgt"]:
-                            ok_n += 1
-                            tgt_parts.append(seg["tgt"])
+                        tgt = (demo or "").strip()
+                    # 译文挂在合并组首段, 其余置空 (合成时 _join_with_pauses 会拼起来)
+                    for j, s in enumerate(segs):
+                        s["tgt"] = tgt if j == 0 else ""
+                        s["translate_merged"] = len(idxs) > 1
+                    if tgt:
+                        ok_n += len(idxs)
+                        tgt_parts.append(tgt)
                 joined = " ".join(t for t in tgt_parts if t)
                 # 汇总 TranslationResult: 优先用逐段拼接统计音节 (避免整段失败导致 length_ratio 失真)
                 src_syl = self.translator._count_syllables(result.asr_result.text, src_lang)
@@ -327,6 +341,7 @@ class CrossLingualPipeline:
                 )
                 logger.info(
                     f"  per-seg ok={ok_n}/{len(result.asr_result.segments)}, "
+                    f"merge_groups={len(merge_groups)}, "
                     f"chars={len(joined)}, ratio={result.translation_result.length_ratio:.2f}"
                 )
             times["translation"] = time.time() - t1
@@ -486,6 +501,38 @@ class CrossLingualPipeline:
                 if len(s.strip()) > 1
             ]
         return sentences
+
+    def _merge_short_segments_for_translation(self, segments: list) -> list:
+        """
+        F7: 同说话人、短间隔、短文本的相邻段合并后再译。
+        返回索引组列表, 例如 [[0], [1,2], [3]]。
+        """
+        if not segments:
+            return []
+        asr_cfg = self.config.get("asr", {})
+        gap_th = float(asr_cfg.get("merge_gap_seconds", 0.35))
+        short_chars = int(asr_cfg.get("merge_short_chars", 8))
+        groups = []
+        cur = [0]
+        for i in range(1, len(segments)):
+            prev, seg = segments[i - 1], segments[i]
+            prev_spk = prev.get("speaker", "SPEAKER_00")
+            spk = seg.get("speaker", "SPEAKER_00")
+            gap = float(seg.get("start", 0)) - float(prev.get("end", 0))
+            prev_len = len(re.sub(r"\s", "", (prev.get("text") or "")))
+            seg_len = len(re.sub(r"\s", "", (seg.get("text") or "")))
+            can_merge = (
+                prev_spk == spk
+                and gap <= gap_th
+                and (prev_len <= short_chars or seg_len <= short_chars)
+            )
+            if can_merge:
+                cur.append(i)
+            else:
+                groups.append(cur)
+                cur = [i]
+        groups.append(cur)
+        return groups
 
     def _segment_emotions(self, audio, sr, segments):
         """逐段情感识别 (用该段的起始~结束音切片), 返回 {index: emotion}"""
@@ -673,6 +720,14 @@ class CrossLingualPipeline:
             q = self._ref_quality_score(clip, sr)
             # 时长接近目标加分
             q_score = q["score"] - abs(_dur(seg) - target) * 0.15
+            # F6: 与当前组情感一致的参考音加分
+            prefer_emo = None
+            if prefer_group_segs:
+                prefer_emo = (prefer_group_segs[0].get("emotion_bucket")
+                              or prefer_group_segs[0].get("emotion"))
+            seg_emo = seg.get("emotion_bucket") or seg.get("emotion")
+            if prefer_emo and seg_emo and prefer_emo == seg_emo and prefer_emo != "neutral":
+                q_score += 1.5
             ranked.append((q_score, q, seg, clip, onset, offset))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
@@ -1071,6 +1126,10 @@ class CrossLingualPipeline:
                         wavs.append(cl.audio.astype(np.float32))
                 # 轻微峰值归一, 降低组间响度跳变
                 group_audio = self._crossfade_concat(wavs, clone_sr, crossfade_ms)
+                # F6: 批处理路径也做情感韵律 hint
+                group_audio = self.voice_cloner._apply_emotion_prosody(
+                    group_audio, clone_sr, emotion
+                )
                 # F4: 批处理路径也按源组时长 time-stretch
                 match_group = bool(seg_cfg.get("match_group_duration", True))
                 if (
@@ -1095,15 +1154,30 @@ class CrossLingualPipeline:
 
         result.clone_meta["speaker_references"] = speaker_ref_meta
 
-        # 6) 组间短静音 (组内已交叉淡化)
+        # 6) 组间静音: F6 对齐源语段间隔 (可读 ASR onset/offset)
         if not group_audios:
             return None
+        gap_min = float(seg_cfg.get("min_gap", 0.05))
+        gap_max = float(seg_cfg.get("max_gap", 0.8))
+        align_gap = bool(seg_cfg.get("align_source_gaps", True))
         parts = []
-        gap = np.zeros(int(min_gap * clone_sr), dtype=np.float32)
         for i, a in enumerate(group_audios):
             parts.append(a)
-            if i < len(group_audios) - 1:
-                parts.append(gap)
+            if i >= len(group_audios) - 1:
+                continue
+            if align_gap and i + 1 < len(groups):
+                prev_segs, next_segs = groups[i]["segs"], groups[i + 1]["segs"]
+                prev_end = float(
+                    prev_segs[-1].get("offset", prev_segs[-1].get("end", 0))
+                )
+                next_start = float(
+                    next_segs[0].get("onset", next_segs[0].get("start", 0))
+                )
+                src_gap = max(0.0, next_start - prev_end)
+                gap_sec = float(np.clip(src_gap, gap_min, gap_max))
+            else:
+                gap_sec = gap_min
+            parts.append(np.zeros(int(gap_sec * clone_sr), dtype=np.float32))
         full = np.concatenate(parts) if parts else np.zeros(clone_sr, dtype=np.float32)
 
         # 归一化
