@@ -26,6 +26,10 @@ outputs/
 # Large / local-only audio (keep small demo samples)
 vad_example.wav
 *.aiff
+# 外场版权/自备样例（不入库；验收用 real_dialog_* / dialog_*）
+data/test_walkman2000_16k.wav
+data/test_qianxia_16k.wav
+data/test_ruguaiawang_16k.wav
 
 # OS junk
 Thumbs.db
