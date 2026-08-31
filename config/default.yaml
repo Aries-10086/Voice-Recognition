@@ -176,3 +176,6 @@ pipeline:
     match_output_duration: true # 整轨输出压到源时长的 0.8–1.2 倍
     duration_ratio_min: 0.8
     duration_ratio_max: 1.2
+    # F6: 组间停顿对齐源语静音
+    align_source_gaps: true
+    max_gap: 0.8                # 组间静音上限(秒)
