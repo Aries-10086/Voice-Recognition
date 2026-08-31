@@ -1,0 +1,30 @@
+{
+  "language": "zh",
+  "segments": [
+    {
+      "start": 0.16,
+      "end": 4.032,
+      "text": "报告警告称没有人能保证目前在伊拉克采取的任何行动能够阻止宗派战争不断增长的暴力或走向混乱",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "start": 5.056,
+      "end": 8.432,
+      "text": "因为远离大陆哺乳动物无法长途跋涉而来使得巨龟成为科隆群岛主要的食草动物",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "start": 10.08,
+      "end": 12.336,
+      "text": "亚马逊河也是地球上最宽的河流有些河段的宽度可达 6 英里",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "start": 13.392,
+      "end": 17.2,
+      "text": "新王国时期的古埃及人惊叹于其前辈的已有一千多年历史的纪念碑",
+      "speaker": "SPEAKER_01"
+    }
+  ],
+  "source": "FLEURS+silence_align"
+}

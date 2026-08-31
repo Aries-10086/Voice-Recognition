@@ -1,0 +1,8 @@
+source: Google FLEURS cmn_hans_cn (CC-BY)
+note: real speech, two gender groups alternating; not TTS
+duration_s: 17.20
+transcript:
+A: 报 告 警 告 称 没 有 人 能 保 证 目 前 在 伊 拉 克 采 取 的 任 何 行 动 能 够 阻 止 宗 派 战 争 不 断 增 长 的 暴 力 或 走 向 混 乱
+B: 因 为 远 离 大 陆 哺 乳 动 物 无 法 长 途 跋 涉 而 来 使 得 巨 龟 成 为 科 隆 群 岛 主 要 的 食 草 动 物
+A: 亚 马 逊 河 也 是 地 球 上 最 宽 的 河 流 有 些 河 段 的 宽 度 可 达 6 英 里
+B: 新 王 国 时 期 的 古 埃 及 人 惊 叹 于 其 前 辈 的 已 有 一 千 多 年 历 史 的 纪 念 碑
