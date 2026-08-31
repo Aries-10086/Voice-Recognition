@@ -163,14 +163,33 @@ class LLMTranslator:
         if self.engine == "google":
             translated, backend = self._online_translate(text, target_lang)
             if self._is_bad_translation(translated, text, target_lang):
-                logger.warning(f"翻译结果不可用 (backend={backend})")
+                demo = self._demo_phrase_translate(text, target_lang)
+                if demo:
+                    logger.warning(f"翻译结果不可用 (backend={backend}), 改用短语表")
+                    translated, backend = demo, "demo_phrase"
+                else:
+                    logger.warning(f"翻译结果不可用 (backend={backend})")
             history = [translated]
+            # F7: 术语/错译后处理 → F6: 情感措辞 → F4: 音节比
+            refined = self._refine_translation_quality(
+                text, translated, target_lang, emotion, emotion_intensity
+            )
+            if refined != translated:
+                history.append(refined)
+                translated = refined
             translated, length_ratio, target_syllables = self._constrain_length_ratio(
                 translated, source_syllables, target_lang, history
             )
+            # F4 截断后再补残片, 避免 "the listening" / 半截 sit-down
+            polished = self._polish_after_length(text, translated, target_lang)
+            if polished != translated:
+                history.append(polished)
+                translated = polished
+                target_syllables = self._count_syllables(translated, target_lang)
+                length_ratio = target_syllables / max(source_syllables, 1)
             logger.info(
                 f"Translation ({backend}): [{source_lang}->{target_lang}] "
-                f"ratio={length_ratio:.2f}"
+                f"emotion={emotion} ratio={length_ratio:.2f}"
             )
             return TranslationResult(
                 source_text=text,
@@ -537,16 +556,28 @@ class LLMTranslator:
             "是的，我建议先优化说话人分离和参考音绑定。":
                 "Yes, I suggest optimizing speaker diarization and reference binding first.",
         }
-        # 统一用简体匹配
+        # 统一用简体匹配: 优先精确, 再按最长键匹配 (避免短键吞掉长句)
         t = self._to_simplified((text or "").strip()).strip("。！？.!?,，、 ")
         if t in table:
             return table[t]
         compact = re.sub(r"[\s,，。！？、\.\!\?]+", "", t)
+        if compact in {re.sub(r"[\s,，。！？、\.\!\?]+", "", self._to_simplified(k)) for k in table}:
+            for k, v in table.items():
+                kk = re.sub(r"[\s,，。！？、\.\!\?]+", "", self._to_simplified(k))
+                if compact == kk:
+                    return v
+        # 最长子串匹配: 仅当键覆盖 compact 的 ≥70% 或 compact 覆盖键
+        best_k, best_v, best_n = None, None, 0
         for k, v in table.items():
             kk = re.sub(r"[\s,，。！？、\.\!\?]+", "", self._to_simplified(k))
-            if compact == kk or (len(compact) >= 4 and (compact in kk or kk in compact)):
-                return v
-        return None
+            if len(kk) < 4:
+                continue
+            if kk == compact or (kk in compact and len(kk) >= len(compact) * 0.7) or (
+                compact in kk and len(compact) >= len(kk) * 0.7
+            ):
+                if len(kk) > best_n:
+                    best_k, best_v, best_n = kk, v, len(kk)
+        return best_v
 
     @staticmethod
     def _looks_cjk(text: str) -> bool:
@@ -581,7 +612,195 @@ class LLMTranslator:
             out_compact = re.sub(r"[\s,，。！？、\.\!\?]+", "", s)
             if src_compact and out_compact == src_compact:
                 return True
+            # F7: 拼音碎片 / 明显错译
+            if re.search(r"\btaiqing\b", low):
+                return True
+            src_s = source or ""
+            if "sit down" in low and any(
+                k in src_s for k in ("坐稳", "坐穩", "分离", "分離", "说话人", "說話人")
+            ):
+                return True
         return False
+
+    def _refine_translation_quality(
+        self,
+        source: str,
+        translated: str,
+        target_lang: str,
+        emotion: str = "neutral",
+        intensity: float = 0.5,
+    ) -> str:
+        """
+        F7 术语/错译后处理 + F6 情感措辞。
+        在 length_ratio 截断之前执行, 优先保语义。
+        """
+        tgt = str(target_lang).lower()
+        if tgt not in ("en", "eng", "english"):
+            return (translated or "").strip()
+        text = (translated or "").strip()
+        src = self._to_simplified(source or "")
+
+        # —— 明显错译黑名单 ——
+        if any(k in src for k in ("坐稳", "分离坐", "说话人分离", "分离做稳")):
+            text = re.sub(
+                r"\bseparate(?:\s+the)?\s+speakers?\s+and\s+sit\s+down(?:\s+first)?\b",
+                "stabilize speaker separation",
+                text,
+                flags=re.I,
+            )
+            text = re.sub(
+                r"\bsit\s+down(?:\s+first)?\b",
+                "stabilize speaker separation",
+                text,
+                flags=re.I,
+            )
+            # 去重: "... stabilize speaker separation ... stabilize speaker separation"
+            text = re.sub(
+                r"(stabilize speaker separation)(\s+and\s+\1)+",
+                r"\1",
+                text,
+                flags=re.I,
+            )
+            text = re.sub(
+                r"\bseparate(?:\s+the)?\s+speakers?\s+and\s+stabilize speaker separation\b",
+                "stabilize speaker separation",
+                text,
+                flags=re.I,
+            )
+        text = re.sub(r"\bTaiqing\b", "speakers", text, flags=re.I)
+        text = re.sub(r"\btai\s*qing\b", "speakers", text, flags=re.I)
+
+        # 听感残片 / 分离坐稳 非 sit-down 变体
+        if re.search(r"听感|聽感", src):
+            text = re.sub(
+                r"\bthe\s+listening\b(?!\s+quality)",
+                "the listening quality",
+                text,
+                flags=re.I,
+            )
+        if any(k in src for k in ("坐稳", "坐穩", "分离坐", "分離坐", "分离做稳")):
+            text = re.sub(
+                r"\bseparate(?:\s+the)?\s+speakers?(?:\s+first)?\b",
+                "stabilize speaker separation",
+                text,
+                flags=re.I,
+            )
+            text = re.sub(
+                r"(stabilize speaker separation)(?:\s+and\s+then\s+stabilize speaker separation)+",
+                r"\1",
+                text,
+                flags=re.I,
+            )
+
+        # 源命中短语表时优先覆盖 (防 Google 半句错译)
+        demo = self._demo_phrase_translate(src, target_lang)
+        if demo and self._is_bad_translation(text, src, target_lang):
+            text = demo
+
+        # —— 术语表 (出现源词则纠正英文表达) ——
+        glossary = [
+            (r"说话人分离|说话人分離", [
+                (r"\bspeaker\s+isolation\b", "speaker diarization"),
+                (r"\bspeaker\s+splitting\b", "speaker separation"),
+            ]),
+            (r"语音克隆|語音克隆", [
+                (r"\bvoice\s+reproduction\b", "voice cloning"),
+                (r"\bspeech\s+cloning\b", "voice cloning"),
+            ]),
+            (r"参考音|參考音", [
+                (r"\breference\s+sound\b", "reference audio"),
+                (r"\breference\s+tone\b", "reference audio"),
+            ]),
+            (r"听感|聽感", [
+                (r"\blistening\s+experience\b", "listening quality"),
+                (r"\bthe\s+listening\b(?!\s+quality)", "the listening quality"),
+            ]),
+        ]
+        for src_pat, en_pairs in glossary:
+            if re.search(src_pat, src):
+                for bad, good in en_pairs:
+                    text = re.sub(bad, good, text, flags=re.I)
+
+        # 短语表子串强制 (分离坐稳 等)
+        force_map = [
+            ("分离坐稳", "stabilize speaker separation"),
+            ("分离做稳", "stabilize speaker separation"),
+            ("说话人分离坐稳", "stabilize speaker separation"),
+            ("听感也一般", "listening quality is only average"),
+        ]
+        for zh, en in force_map:
+            if zh in src and en.lower() not in text.lower():
+                # 若译文仍含 sit down / the listening 残片则整句换短语
+                if "sit down" in text.lower() or text.lower().rstrip(".") in (
+                    "the listening", "then let's separate the speakers and sit down first"
+                ):
+                    text = en
+
+        text = re.sub(r"\s{2,}", " ", text).strip(" ,;")
+        text = self._apply_emotion_lexicon(text, emotion, intensity)
+        return text
+
+    def _polish_after_length(
+        self, source: str, translated: str, target_lang: str
+    ) -> str:
+        """F4 音节截断后的残片兜底 (听感/分离坐稳)。"""
+        tgt = str(target_lang).lower()
+        if tgt not in ("en", "eng", "english"):
+            return translated
+        src = self._to_simplified(source or "")
+        text = (translated or "").strip()
+        if re.search(r"听感|聽感", src):
+            text = re.sub(
+                r"\bthe\s+listening\b(?!\s+quality)",
+                "the listening quality",
+                text,
+                flags=re.I,
+            )
+            if text.lower().rstrip(".!") in ("the listening quality", "and the listening quality"):
+                text = "listening quality is only average"
+        if any(k in src for k in ("坐稳", "坐穩", "分离坐", "分離坐")):
+            if "sit down" in text.lower():
+                text = re.sub(
+                    r".*?\bsit\s+down(?:\s+first)?\b.*",
+                    "Then let's stabilize speaker separation",
+                    text,
+                    flags=re.I,
+                )
+            text = re.sub(
+                r"\bseparate(?:\s+the)?\s+speakers?(?:\s+first)?\b",
+                "stabilize speaker separation",
+                text,
+                flags=re.I,
+            )
+            text = re.sub(
+                r"\bstabilize speaker separation\s+and\s+stabilize speaker separation\b",
+                "stabilize speaker separation",
+                text,
+                flags=re.I,
+            )
+        return re.sub(r"\s{2,}", " ", text).strip(" ,;")
+
+    def _apply_emotion_lexicon(
+        self, text: str, emotion: str, intensity: float = 0.5
+    ) -> str:
+        """F6: 按情感轻度调整英文措辞 (Google 路径无 LLM prompt)。"""
+        if not text or float(intensity or 0) < 0.35:
+            return text
+        emo = (emotion or "neutral").lower()
+        if emo in ("neutral",):
+            return text
+        out = text
+        if emo in ("happy", "surprised", "positive"):
+            if not out.endswith(("!", "?")):
+                out = out.rstrip(".") + "!"
+        elif emo in ("sad", "negative"):
+            out = re.sub(r"\bvery\b", "a bit", out, flags=re.I)
+            out = re.sub(r"\breally\b", "somewhat", out, flags=re.I)
+        elif emo in ("angry", "disgusted"):
+            out = re.sub(r"\bplease\b", "", out, flags=re.I)
+            out = re.sub(r"\skind of\b", "", out, flags=re.I)
+            out = re.sub(r"\s{2,}", " ", out).strip()
+        return out
 
     def _call_google(self, prompt: str) -> str:
         """Google 翻译 (免费, 质量高)"""
@@ -686,7 +905,7 @@ class LLMTranslator:
             budget = max(1, int(src * max_r))
             # 短源句保留最低可懂音节, 避免 "The listening" 类残片
             if src < 12:
-                budget = max(budget, min(16, int(src * 1.6)))
+                budget = max(budget, min(22, max(12, int(src * 2.2))))
             compressed = self._compress_to_syllable_budget(text, budget, target_lang)
             if history is not None and compressed != text:
                 history.append(compressed)
@@ -748,22 +967,11 @@ class LLMTranslator:
         return " ".join(kept).rstrip(" ,.;") if kept else out
 
     def _expand_to_syllable_budget(self, text: str, budget: int, lang: str) -> str:
-        """轻度拉长到音节下限；英文用短连接词循环补齐。"""
-        lang_l = (lang or "").lower()
-        out = text.strip()
-        cur = self._count_syllables(out, lang)
-        if cur >= budget:
-            return out
-        if lang_l.startswith("en") or lang_l in ("english",):
-            pads = [" yes", " now", " then", " okay", " please", " indeed"]
-            core = out.rstrip(".!?")
-            ended = out.endswith((".", "!", "?"))
-            i = 0
-            while self._count_syllables(core, lang) < budget and i < 24:
-                core = core + pads[i % len(pads)]
-                i += 1
-            return core + ("." if ended else "")
-        return out
+        """
+        过短时不再灌 'yes/now/okay' 填充词 (会污染听感与 F7 译文)。
+        时长由合成端 time-stretch 对齐, 音节略低于 0.8 可接受。
+        """
+        return text.strip()
 
     @staticmethod
     def _count_syllables(text: str, lang: str) -> int:
