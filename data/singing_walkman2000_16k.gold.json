@@ -1,0 +1,67 @@
+{
+  "language": "zh",
+  "domain": "singing",
+  "title": "随身听2000",
+  "lyrics_hint": "周杰伦 爱在西元前 磁带 耳机 Memory 2000",
+  "asr_bypass": true,
+  "source": "test_walkman2000_16k + 人工关键词 (2026-09-02)",
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 5.3,
+      "speaker": "SPEAKER_00",
+      "text": "周杰伦的磁带开启了一个时代文山的词飞过学生时代",
+      "keywords": [
+        "周杰伦",
+        "磁带",
+        "时代",
+        "文山"
+      ]
+    },
+    {
+      "start": 5.3,
+      "end": 14.8,
+      "speaker": "SPEAKER_00",
+      "text": "放在宅子当代歌摊放在守着电台点歌新概念作文是语文歌唱最好的选择",
+      "keywords": [
+        "电台",
+        "点歌",
+        "新概念作文"
+      ]
+    },
+    {
+      "start": 14.8,
+      "end": 21.5,
+      "speaker": "SPEAKER_00",
+      "text": "爱在西元前听成爱在西元前藏在袖子里的耳机星期一到星期天",
+      "keywords": [
+        "爱在西元前",
+        "耳机",
+        "星期一"
+      ]
+    },
+    {
+      "start": 21.5,
+      "end": 42.0,
+      "speaker": "SPEAKER_00",
+      "text": "江南的雨连呈现乡下的雨如果想起外婆也是我第一首钢琴练习曲现在我写歌惦记你",
+      "keywords": [
+        "外婆",
+        "钢琴",
+        "练习曲"
+      ]
+    },
+    {
+      "start": 42.0,
+      "end": 60.0,
+      "speaker": "SPEAKER_00",
+      "text": "陪伴我走我青春记得我的岁月深情我的Memory我的2000",
+      "keywords": [
+        "青春",
+        "Memory",
+        "2000",
+        "岁月"
+      ]
+    }
+  ]
+}

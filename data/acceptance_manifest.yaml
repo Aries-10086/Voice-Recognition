@@ -1,0 +1,47 @@
+# F8 四类验收样例清单 (A4)
+# run_dir 可选：固定引用某次 run；留空则 batch_acceptance 取最新 outputs/run_*
+
+samples:
+  - id: solo_fleurs
+    category: solo
+    file: data/solo_fleurs_excerpt_16k.wav
+    target_lang: en
+    args: []
+
+  - id: dialog_standard
+    category: dialog
+    file: data/dialog_two_speakers_16k.wav
+    target_lang: en
+    args: []
+    run_dir: outputs/run_20260831_102342
+
+  - id: fleurs_real
+    category: dialog
+    file: data/real_dialog_02.wav
+    target_lang: en
+    run_dir: outputs/run_20260831_153353
+
+  - id: noisy_en
+    category: noisy
+    file: data/real_dialog_01.wav
+    target_lang: en
+    args: []
+
+  - id: singing_gold
+    category: singing
+    file: data/singing_ruguaiawang_16k.wav
+    target_lang: en
+    args: ["--singing", "--assume-single-speaker"]
+    run_dir: outputs/run_20260902_102910
+
+  - id: singing_walkman
+    category: singing
+    file: data/singing_walkman2000_16k.wav
+    target_lang: en
+    args: ["--singing", "--assume-single-speaker", "--no-gold", "--no-lyrics-hint"]
+
+  - id: oral_xiaoxiong
+    category: solo
+    file: data/singing_guanyuxiaoxiong_16k.wav
+    target_lang: en
+    args: ["--assume-single-speaker", "--no-gold", "--no-lyrics-hint"]

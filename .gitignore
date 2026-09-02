@@ -30,6 +30,10 @@ vad_example.wav
 data/test_walkman2000_16k.wav
 data/test_qianxia_16k.wav
 data/test_ruguaiawang_16k.wav
+# 由用户 MP3 制备的清唱 wav（保留 .gold.json；本地用 prepare_singing_sample.py 再生）
+data/singing_ruguaiawang_16k.wav
+data/singing_walkman2000_16k.wav
+data/singing_guanyuxiaoxiong_16k.wav
 
 # OS junk
 Thumbs.db
