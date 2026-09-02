@@ -144,10 +144,18 @@ translation:
 python scripts/demo.py
 
 # 完整Pipeline
-python scripts/run_pipeline.py --input audio.wav --target-lang en
+python run_pipeline.py --input audio.wav --target-lang en
 
-# 指定参考音频克隆
-python scripts/run_pipeline.py --input speech.wav --ref-audio speaker.wav --target-lang ja
+# 清唱 gold 全链路
+python run_pipeline.py --input data/singing_ruguaiawang_16k.wav \
+  --singing --assume-single-speaker -t en --device cpu
+
+# LLM 翻译主路径 (本地模型已缓存)
+python run_pipeline.py --input data/real_dialog_02.wav -t en --translate-engine local
+
+# 批量验收 + 演示包说明
+python scripts/batch_acceptance.py --collect-only
+# 详见 docs/demo_pack/README.md
 ```
 
 ---
