@@ -12,6 +12,8 @@ datasets>=2.20.0
 
 # --- ASR 语音识别 ---
 faster-whisper>=1.0.3
+# 可选：清唱/中文对比引擎 — pip install funasr
+# funasr>=1.4.0
 
 # --- 情感识别 (emotion2vec需手动安装, 代码已内置wav2vec2自动降级) ---
 # 手动安装emotion2vec: git clone https://github.com/ddlBoJack/emotion2vec.git && pip install -e emotion2vec/
