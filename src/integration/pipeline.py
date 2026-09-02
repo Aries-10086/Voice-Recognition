@@ -104,6 +104,8 @@ class PipelineResult:
     error_message: str = ""
     diarization_meta: Dict = field(default_factory=dict)
     clone_meta: Dict = field(default_factory=dict)
+    asr_meta: Dict = field(default_factory=dict)
+    quality_meta: Dict = field(default_factory=dict)
 
 
 class CrossLingualPipeline:
@@ -140,6 +142,7 @@ class CrossLingualPipeline:
         self.timeline_generator = None
         self.voice_cloner = None
 
+        self._run_effective_asr = None
         self._init_modules()
 
     def _init_modules(self):
@@ -183,6 +186,11 @@ class CrossLingualPipeline:
         target_lang: str = "en",
         reference_audio_path: Optional[str] = None,
         output_dir: Optional[str] = None,
+        prompt_profile: Optional[str] = None,
+        assume_single_speaker: Optional[bool] = None,
+        skip_gold: bool = False,
+        no_lyrics_hint: bool = False,
+        generic_asr_refine: bool = False,
     ) -> PipelineResult:
         """
         运行完整Pipeline
@@ -214,10 +222,25 @@ class CrossLingualPipeline:
         t0 = time.time()
 
         try:
+            self._no_lyrics_hint = bool(no_lyrics_hint)
+            self._generic_asr_refine = bool(generic_asr_refine)
+            result.quality_meta["no_lyrics_hint"] = self._no_lyrics_hint
+            result.quality_meta["generic_asr_refine"] = self._generic_asr_refine
+
+            run_ctx = self._prepare_run_context(
+                audio_path, prompt_profile, assume_single_speaker, no_lyrics_hint
+            )
+            effective_asr = run_ctx["effective_asr"]
+            self._run_effective_asr = effective_asr
+            self._run_domain = run_ctx.get("domain", "dialog")
+            self._run_sidecar = run_ctx.get("sidecar") or {}
+            result.quality_meta["domain"] = run_ctx.get("domain", "dialog")
+            result.quality_meta["prompt_profile"] = run_ctx.get("profile", "neutral")
+
             t1 = time.time()
             logger.info("[1/7] Loading audio...")
             audio, sr = AudioUtils.load_audio(audio_path)
-            gold = self._load_gold_transcript(audio_path)
+            gold = None if skip_gold else self._load_gold_transcript(audio_path)
             # 有金标时不要 trim_silence, 否则时间轴与 gold 错位; 且可能裁掉首句
             if gold is None:
                 audio = AudioUtils.trim_silence(audio, sr)
@@ -236,9 +259,24 @@ class CrossLingualPipeline:
                     result.detected_language = gold.language or "zh"
                     logger.info(f"   lang: {result.detected_language} (gold transcript)")
                 else:
-                    result.asr_result = self.asr.transcribe(audio, sr)
+                    if self.asr is not None:
+                        self.asr.reload_if_needed(effective_asr)
+                    result.asr_result = self.asr.transcribe(
+                        audio, sr, asr_config=effective_asr
+                    )
+                    result.asr_meta = dict(result.asr_result.meta or {})
+                    result.asr_result = self._post_refine_asr(
+                        result.asr_result,
+                        run_ctx,
+                        effective_asr,
+                    )
+                    result.asr_meta["asr_post_refine"] = result.asr_result.meta.get(
+                        "asr_post_refine", ""
+                    )
                     result.detected_language = result.asr_result.language
                     logger.info(f"   lang: {result.detected_language}")
+                    if result.asr_meta.get("asr_prompt_retry"):
+                        logger.info("   ASR: prompt retry (hallucination guard)")
 
                 # 说话人分离 (识别不同人声; pyannote 不可用时离线聚类兜底 + 明确降级提示)
                 # 注意: 不要复用情感嵌入做说话人聚类 (情感空间会抹平音色差异)
@@ -253,19 +291,31 @@ class CrossLingualPipeline:
                     }
                     logger.info("   diarization: using gold speaker labels")
                 elif self.diarizer is not None:
-                    seg_speakers = self.diarizer.diarize(
-                        audio, sr, result.asr_result.segments, embedding_fn=None
-                    )
-                    result.diarization_meta = dict(
-                        getattr(self.diarizer, "last_meta", {}) or {}
-                    )
-                    confs = result.diarization_meta.get("label_confidences") or []
-                    for i, (seg, spk) in enumerate(
-                        zip(result.asr_result.segments, seg_speakers)
-                    ):
-                        seg["speaker"] = spk
-                        if i < len(confs):
-                            seg["label_confidence"] = round(float(confs[i]), 3)
+                    if run_ctx.get("assume_single_speaker"):
+                        for seg in result.asr_result.segments:
+                            seg["speaker"] = "SPEAKER_00"
+                        result.diarization_meta = {
+                            "backend": "assume_single_speaker",
+                            "n_speakers": 1,
+                            "degraded": False,
+                            "first_round_speakers": 1,
+                            "used_retry": False,
+                        }
+                        logger.info("   diarization: assume_single_speaker (清唱/单人)")
+                    else:
+                        seg_speakers = self.diarizer.diarize(
+                            audio, sr, result.asr_result.segments, embedding_fn=None
+                        )
+                        result.diarization_meta = dict(
+                            getattr(self.diarizer, "last_meta", {}) or {}
+                        )
+                        confs = result.diarization_meta.get("label_confidences") or []
+                        for i, (seg, spk) in enumerate(
+                            zip(result.asr_result.segments, seg_speakers)
+                        ):
+                            seg["speaker"] = spk
+                            if i < len(confs):
+                                seg["label_confidence"] = round(float(confs[i]), 3)
                 else:
                     for seg in result.asr_result.segments:
                         seg["speaker"] = "SPEAKER_00"
@@ -281,9 +331,16 @@ class CrossLingualPipeline:
             if self.emotion_recognizer is not None and result.asr_result is not None:
                 seg_emos = self._segment_emotions(audio, sr, result.asr_result.segments)
                 default_emo = result.emotion_result.emotion if result.emotion_result else "neutral"
-                for i, seg in enumerate(result.asr_result.segments):
-                    seg["emotion"] = seg_emos.get(i, default_emo)
-                    seg["emotion_bucket"] = self._emotion_bucket(seg["emotion"])
+                singing_cfg = self.config.get("pipeline", {}).get("singing", {})
+                if self._run_domain == "singing":
+                    default_emo = singing_cfg.get("default_emotion", "sad")
+                    for i, seg in enumerate(result.asr_result.segments):
+                        seg["emotion"] = default_emo
+                        seg["emotion_bucket"] = self._emotion_bucket(default_emo)
+                else:
+                    for i, seg in enumerate(result.asr_result.segments):
+                        seg["emotion"] = seg_emos.get(i, default_emo)
+                        seg["emotion_bucket"] = self._emotion_bucket(seg["emotion"])
             times["asr+emotion"] = time.time() - t1
             n_spk = len(set(s.get("speaker","?") for s in result.asr_result.segments)) if result.asr_result else 1
             if n_spk <= 1 and result.asr_result and len(result.asr_result.segments) >= 4:
@@ -301,6 +358,9 @@ class CrossLingualPipeline:
                 emo = result.emotion_result.emotion if result.emotion_result else "neutral"
                 emo_i = result.emotion_result.intensity if result.emotion_result else 0.5
                 emo_v = result.emotion_result.valence if result.emotion_result else 0.0
+                result.quality_meta["translation_engine"] = getattr(
+                    self.translator, "engine", "?"
+                )
                 # O1: 超短 ASR 碎屑并入前一段文本, 再 F7 合并译
                 self._glue_asr_crumbs(result.asr_result.segments)
                 merge_groups = self._merge_short_segments_for_translation(
@@ -308,41 +368,102 @@ class CrossLingualPipeline:
                 )
                 tgt_parts = []
                 ok_n = 0
-                group_tgts = []  # 与 merge_groups 对齐, 供空译文二次合并重试
-                for idxs in merge_groups:
-                    segs = [result.asr_result.segments[i] for i in idxs]
-                    src = "".join((s.get("text") or "").strip() for s in segs).strip()
-                    if not src:
-                        for s in segs:
-                            s["tgt"] = ""
-                        group_tgts.append("")
-                        continue
-                    seg_emo = segs[0].get("emotion", emo)
-                    tgt = self._translate_segment_text(
-                        src, src_lang, target_lang, seg_emo, emo_i, emo_v
-                    )
-                    # 译文挂在合并组首段, 其余置空 (合成时 _join_with_pauses 会拼起来)
-                    for j, s in enumerate(segs):
-                        s["tgt"] = tgt if j == 0 else ""
-                        s["translate_merged"] = len(idxs) > 1
-                    group_tgts.append(tgt)
-                    if tgt:
-                        ok_n += len(idxs)
-                        tgt_parts.append(tgt)
+                group_tgts = []
+                doc_tr = None
 
-                # O2: 空译文组与下一同说话人组合并再译一次
-                retry_n = self._retry_empty_translations(
-                    result.asr_result.segments,
-                    merge_groups,
-                    group_tgts,
-                    src_lang,
-                    target_lang,
-                    emo,
-                    emo_i,
-                    emo_v,
-                )
-                if retry_n:
-                    # 按组统计: 首段有 tgt 则整组算成功
+                if self._run_domain == "singing":
+                    doc_tr, ok_n = self._translate_singing_document(
+                        result.asr_result.segments,
+                        src_lang,
+                        target_lang,
+                        emo,
+                        emo_i,
+                        emo_v,
+                        self._run_sidecar,
+                    ) or (None, 0)
+                    if doc_tr is not None:
+                        result.quality_meta["translation_mode"] = "singing_lyrics"
+                        result.quality_meta["translation_backend"] = getattr(
+                            self.translator, "last_backend", self.translator.engine
+                        )
+                        tgt_parts = [
+                            (s.get("tgt") or "").strip()
+                            for s in result.asr_result.segments
+                            if (s.get("tgt") or "").strip()
+                        ]
+                        for idxs in merge_groups:
+                            t = (result.asr_result.segments[idxs[0]].get("tgt") or "").strip()
+                            group_tgts.append(t)
+
+                if doc_tr is None:
+                    for idxs in merge_groups:
+                        segs = [result.asr_result.segments[i] for i in idxs]
+                        src = "".join((s.get("text") or "").strip() for s in segs).strip()
+                        if not src:
+                            for s in segs:
+                                s["tgt"] = ""
+                            group_tgts.append("")
+                            continue
+                        seg_emo = segs[0].get("emotion", emo)
+                        tgt = self._translate_segment_text(
+                            src, src_lang, target_lang, seg_emo, emo_i, emo_v
+                        )
+                        for j, s in enumerate(segs):
+                            s["tgt"] = tgt if j == 0 else ""
+                            s["translate_merged"] = len(idxs) > 1
+                        group_tgts.append(tgt)
+                        if tgt:
+                            ok_n += len(idxs)
+                            tgt_parts.append(tgt)
+                else:
+                    joined = doc_tr.translated_text
+                    src_syl = doc_tr.source_syllables
+                    tgt_syl = doc_tr.target_syllables
+                    length_ratio = doc_tr.length_ratio
+                    from src.translation.llm_translator import TranslationResult
+                    result.translation_result = doc_tr
+                    result.quality_meta["per_seg_translate_ok"] = ok_n
+                    result.quality_meta["per_seg_translate_ratio"] = (
+                        ok_n / max(len(result.asr_result.segments), 1)
+                    )
+                    times["translation"] = time.time() - t1
+                    logger.info(
+                        f"  singing lyrics doc translate ratio={length_ratio:.2f} "
+                        f"backend={result.quality_meta.get('translation_backend')}"
+                    )
+                    # 跳过下方整篇 TranslationResult 重建
+                    doc_tr = "done"
+
+                if doc_tr != "done":
+                    retry_n = self._retry_empty_translations(
+                        result.asr_result.segments,
+                        merge_groups,
+                        group_tgts,
+                        src_lang,
+                        target_lang,
+                        emo,
+                        emo_i,
+                        emo_v,
+                    )
+                    if retry_n:
+                        ok_n = 0
+                        tgt_parts = []
+                        for idxs in merge_groups:
+                            t = (result.asr_result.segments[idxs[0]].get("tgt") or "").strip()
+                            if t:
+                                ok_n += len(idxs)
+                                tgt_parts.append(t)
+                        logger.info(f"  empty-translate retry recovered {retry_n} group(s)")
+
+                    self._ensure_longest_segment_translated(
+                        result.asr_result.segments,
+                        merge_groups,
+                        src_lang,
+                        target_lang,
+                        emo,
+                        emo_i,
+                        emo_v,
+                    )
                     ok_n = 0
                     tgt_parts = []
                     for idxs in merge_groups:
@@ -350,49 +471,49 @@ class CrossLingualPipeline:
                         if t:
                             ok_n += len(idxs)
                             tgt_parts.append(t)
-                    logger.info(f"  empty-translate retry recovered {retry_n} group(s)")
 
-                joined = " ".join(t for t in tgt_parts if t)
-                # 汇总 TranslationResult: 优先用逐段拼接统计音节 (避免整段失败导致 length_ratio 失真)
-                src_syl = self.translator._count_syllables(result.asr_result.text, src_lang)
-                tgt_syl = self.translator._count_syllables(joined, target_lang) if joined else 0
-                length_ratio = tgt_syl / max(src_syl, 1)
-                # 整篇再压一次 length_ratio (段级贴边汇总后可能略超)
-                max_r = float(self.config.get("translation", {}).get("length_ratio_max", 1.2))
-                min_r = float(self.config.get("translation", {}).get("length_ratio_min", 0.8))
-                if joined and (length_ratio > max_r or length_ratio < min_r):
-                    hist = [joined]
-                    joined, length_ratio, tgt_syl = self.translator._constrain_length_ratio(
-                        joined, src_syl, target_lang, hist
-                    )
-                    # 截断后残片修补
-                    joined = self.translator._polish_after_length(
-                        result.asr_result.text, joined, target_lang
-                    )
-                    tgt_syl = self.translator._count_syllables(joined, target_lang)
+                    joined = " ".join(t for t in tgt_parts if t)
+                    src_syl = self.translator._count_syllables(result.asr_result.text, src_lang)
+                    tgt_syl = self.translator._count_syllables(joined, target_lang) if joined else 0
                     length_ratio = tgt_syl / max(src_syl, 1)
-                    # 写回末段 tgt 不便拆分, 仅更新汇总译文供 summary/timeline
-                    logger.info(
-                        f"  doc-level length refine → ratio={length_ratio:.2f}"
+                    max_r = float(self.config.get("translation", {}).get("length_ratio_max", 1.2))
+                    min_r = float(self.config.get("translation", {}).get("length_ratio_min", 0.8))
+                    if joined and (length_ratio > max_r or length_ratio < min_r):
+                        hist = [joined]
+                        joined, length_ratio, tgt_syl = self.translator._constrain_length_ratio(
+                            joined, src_syl, target_lang, hist
+                        )
+                        joined = self.translator._polish_after_length(
+                            result.asr_result.text, joined, target_lang
+                        )
+                        tgt_syl = self.translator._count_syllables(joined, target_lang)
+                        length_ratio = tgt_syl / max(src_syl, 1)
+                        logger.info(
+                            f"  doc-level length refine → ratio={length_ratio:.2f}"
+                        )
+                    from src.translation.llm_translator import TranslationResult
+                    result.translation_result = TranslationResult(
+                        source_text=result.asr_result.text,
+                        translated_text=joined,
+                        source_lang=src_lang,
+                        target_lang=target_lang,
+                        emotion=emo,
+                        source_syllables=src_syl,
+                        target_syllables=tgt_syl,
+                        length_ratio=length_ratio,
+                        confidence=0.85 if ok_n == len(result.asr_result.segments) else 0.6,
+                        refinement_history=[joined],
                     )
-                from src.translation.llm_translator import TranslationResult
-                result.translation_result = TranslationResult(
-                    source_text=result.asr_result.text,
-                    translated_text=joined,
-                    source_lang=src_lang,
-                    target_lang=target_lang,
-                    emotion=emo,
-                    source_syllables=src_syl,
-                    target_syllables=tgt_syl,
-                    length_ratio=length_ratio,
-                    confidence=0.85 if ok_n == len(result.asr_result.segments) else 0.6,
-                    refinement_history=[joined],
-                )
-                logger.info(
-                    f"  per-seg ok={ok_n}/{len(result.asr_result.segments)}, "
-                    f"merge_groups={len(merge_groups)}, "
-                    f"chars={len(joined)}, ratio={result.translation_result.length_ratio:.2f}"
-                )
+                    logger.info(
+                        f"  per-seg ok={ok_n}/{len(result.asr_result.segments)}, "
+                        f"merge_groups={len(merge_groups)}, "
+                        f"chars={len(joined)}, ratio={result.translation_result.length_ratio:.2f}"
+                    )
+                    n_seg = len(result.asr_result.segments)
+                    result.quality_meta["per_seg_translate_ok"] = ok_n
+                    result.quality_meta["per_seg_translate_ratio"] = (
+                        ok_n / max(n_seg, 1)
+                    )
             times["translation"] = time.time() - t1
             logger.info(f"  {times['translation']:.1f}s")
 
@@ -480,7 +601,7 @@ class CrossLingualPipeline:
                 )
 
             times["clone"] = time.time() - t1_clone
-            result.status = "success"
+            result.status = self._finalize_run_status(result)
             result.processing_time = time.time() - t0
 
             total = result.processing_time
@@ -551,6 +672,19 @@ class CrossLingualPipeline:
             ]
         return sentences
 
+    def _read_gold_sidecar(self, audio_path: str) -> Dict:
+        """读取同名 .gold.json 元数据 (不要求 asr_bypass)。"""
+        from pathlib import Path
+        import json
+        p = Path(audio_path)
+        gold_path = p.with_suffix(".gold.json")
+        if not gold_path.exists():
+            return {}
+        try:
+            return json.loads(gold_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
     def _load_gold_transcript(self, audio_path: str):
         """
         若存在同名 .gold.json, 用金标文本(+可选时间戳)旁路 ASR。
@@ -568,6 +702,8 @@ class CrossLingualPipeline:
             return None
         try:
             data = json.loads(gold_path.read_text(encoding="utf-8"))
+            if data.get("asr_bypass") is False:
+                return None
             segs = data.get("segments") or []
             if not segs:
                 return None
@@ -580,6 +716,8 @@ class CrossLingualPipeline:
                 item = {
                     "start": float(s.get("start", 0)),
                     "end": float(s.get("end", s.get("start", 0) + 1)),
+                    "onset": float(s.get("start", 0)),
+                    "offset": float(s.get("end", s.get("start", 0) + 1)),
                     "text": text,
                     "words": s.get("words") or [],
                     "syllables": s.get("syllables") or [],
@@ -598,10 +736,289 @@ class CrossLingualPipeline:
                 segments=norm,
                 duration=dur,
                 confidence=1.0,
+                meta={
+                    "gold": True,
+                    "title": data.get("title"),
+                    "lyrics_hint": data.get("lyrics_hint"),
+                },
             )
         except Exception as e:
             logger.warning(f"gold transcript load fail: {e}")
             return None
+
+    def _active_asr_cfg(self) -> Dict:
+        eff = getattr(self, "_run_effective_asr", None)
+        return eff or self.config.get("asr", {})
+
+    def _prepare_run_context(
+        self,
+        audio_path: str,
+        prompt_profile: Optional[str],
+        assume_single_speaker: Optional[bool],
+        no_lyrics_hint: bool = False,
+    ) -> Dict:
+        """S1: 合并 prompt profile、清唱切段参数与单人分人开关。"""
+        from src.asr.asr_profiles import apply_profile
+
+        asr_cfg = self.config.get("asr", {})
+        profile = prompt_profile or asr_cfg.get("prompt_profile") or "neutral"
+        # 文件名启发: singing_*.wav → singing profile
+        stem = Path(audio_path).stem.lower()
+        if not prompt_profile and stem.startswith("singing_"):
+            profile = "singing"
+        effective_asr, profile = apply_profile(asr_cfg, profile)
+        sidecar = self._read_gold_sidecar(audio_path)
+
+        singing_cfg = self.config.get("pipeline", {}).get("singing", {})
+        if profile == "singing":
+            prompt = (effective_asr.get("initial_prompt") or "").strip()
+            title = sidecar.get("title") or singing_cfg.get("title")
+            hint = sidecar.get("lyrics_hint") or singing_cfg.get("lyrics_hint") or ""
+            if not no_lyrics_hint:
+                if title:
+                    prompt += f" 歌曲《{title}》。"
+                if hint:
+                    prompt += f" 歌词包含：{hint}。"
+                extra_corr = (
+                    sidecar.get("corrections")
+                    or singing_cfg.get("corrections")
+                    or asr_cfg.get("singing_corrections")
+                    or []
+                )
+                if extra_corr:
+                    base = list(effective_asr.get("corrections") or [])
+                    effective_asr["corrections"] = base + list(extra_corr)
+            effective_asr["initial_prompt"] = prompt.strip()
+            effective_asr["_lyrics_hint"] = "" if no_lyrics_hint else hint
+            effective_asr["_song_title"] = "" if no_lyrics_hint else (title or "")
+            effective_asr["_no_lyrics_hint"] = no_lyrics_hint
+        elif profile == "neutral":
+            from src.asr.singing_corrector import load_lexicon_broadcast
+
+            lex_path = asr_cfg.get("lexicon_broadcast") or "data/lexicon_broadcast.txt"
+            lex_full = Path(lex_path) if Path(lex_path).is_absolute() else _PROJECT_ROOT / lex_path
+            hotwords, lex_pairs = load_lexicon_broadcast(str(lex_full))
+            if hotwords:
+                prompt = (effective_asr.get("initial_prompt") or "").strip()
+                effective_asr["initial_prompt"] = (
+                    prompt + " 可能出现的专名：" + "、".join(hotwords[:12]) + "。"
+                ).strip()
+            if lex_pairs:
+                base = list(effective_asr.get("corrections") or [])
+                effective_asr["corrections"] = base + [[a, b] for a, b in lex_pairs]
+
+        domain = singing_cfg.get("domain", "dialog")
+        assume = assume_single_speaker
+        if assume is None:
+            if profile == "singing":
+                assume = bool(singing_cfg.get("assume_single_speaker", True))
+            else:
+                assume = bool(
+                    self.config.get("pipeline", {})
+                    .get("diarization", {})
+                    .get("assume_single_speaker", False)
+                )
+        if profile == "singing":
+            domain = singing_cfg.get("domain", "singing")
+            # 清唱时 merge 参数已在 profile 合并进 effective_asr
+            self.config.setdefault("pipeline", {}).setdefault("diarization", {})
+            if assume:
+                self.config["pipeline"]["diarization"]["expected_speakers"] = int(
+                    singing_cfg.get("expected_speakers", 1)
+                )
+        logger.info(
+            f"Run context: profile={profile} domain={domain} "
+            f"assume_single={assume} asr_model={effective_asr.get('model_name')}"
+        )
+        return {
+            "profile": profile,
+            "domain": domain,
+            "assume_single_speaker": assume,
+            "effective_asr": effective_asr,
+            "sidecar": sidecar,
+        }
+
+    def _post_refine_asr(self, asr_result, run_ctx: Dict, effective_asr: Dict):
+        """S5/G4: Whisper 输出后校正（说话 / 清唱）。"""
+        from src.asr.singing_corrector import refine_dialog_transcript, refine_singing_transcript
+
+        profile = run_ctx.get("profile", "neutral")
+        meta = dict(asr_result.meta or {})
+        sidecar = run_ctx.get("sidecar") or getattr(self, "_run_sidecar", {}) or {}
+
+        if profile == "singing":
+            if getattr(self, "_no_lyrics_hint", False) and not getattr(
+                self, "_generic_asr_refine", False
+            ):
+                # 真 ASR：仍做通用同音修正（不注入歌词/歌名）
+                text, segs = refine_singing_transcript(
+                    asr_result.text,
+                    asr_result.segments,
+                    use_lyrics_hint=False,
+                    use_song_corrections=False,
+                    generic_llm=False,
+                )
+                meta["asr_post_refine"] = "singing_generic_homophone"
+                asr_result.text = text
+                asr_result.segments = segs
+                asr_result.meta = meta
+                return asr_result
+            text, segs = refine_singing_transcript(
+                asr_result.text,
+                asr_result.segments,
+                hint=effective_asr.get("_lyrics_hint") or sidecar.get("lyrics_hint") or "",
+                title=effective_asr.get("_song_title") or sidecar.get("title") or "",
+                corrections=effective_asr.get("corrections"),
+                use_lyrics_hint=not getattr(self, "_no_lyrics_hint", False),
+                use_song_corrections=not getattr(self, "_no_lyrics_hint", False),
+                generic_llm=getattr(self, "_generic_asr_refine", False),
+                llm_config=self.config.get("translation", {}),
+            )
+            meta["asr_post_refine"] = (
+                "singing_generic_llm" if getattr(self, "_generic_asr_refine", False)
+                else ("singing_no_hint" if getattr(self, "_no_lyrics_hint", False) else "singing")
+            )
+        else:
+            text, segs = refine_dialog_transcript(
+                asr_result.text,
+                asr_result.segments,
+                corrections=effective_asr.get("corrections"),
+            )
+            meta["asr_post_refine"] = "dialog"
+
+        asr_result.text = text
+        asr_result.segments = segs
+        asr_result.meta = meta
+        return asr_result
+
+    @staticmethod
+    def _distribute_translation(full_tgt: str, segments: list) -> None:
+        """按源段字数比例切分整篇歌词译文到各段首行。"""
+        full_tgt = (full_tgt or "").strip()
+        if not full_tgt or not segments:
+            return
+        weights = [max(len((s.get("text") or "").strip()), 1) for s in segments]
+        total = sum(weights)
+        words = full_tgt.split()
+        if not words:
+            for s in segments:
+                s["tgt"] = ""
+            return
+        cursor = 0
+        n_words = len(words)
+        for i, seg in enumerate(segments):
+            share = weights[i] / total
+            take = max(1, round(n_words * share)) if i < len(segments) - 1 else n_words - cursor
+            chunk = " ".join(words[cursor : cursor + take]).strip()
+            cursor += take
+            seg["tgt"] = chunk
+            seg["translate_merged"] = False
+
+    def _translate_singing_document(
+        self,
+        segments,
+        src_lang,
+        target_lang,
+        emo,
+        emo_i,
+        emo_v,
+        sidecar: dict,
+    ) -> tuple:
+        """C4: 整首歌词意译后按比例分配到各 ASR 段。"""
+        singing_cfg = self.config.get("pipeline", {}).get("singing", {})
+        if not singing_cfg.get("merge_lyrics_translate", True):
+            return None
+        src = "".join((s.get("text") or "").strip() for s in segments).strip()
+        if not src or self.translator is None:
+            return None
+        title = sidecar.get("title") or singing_cfg.get("title") or ""
+        hint = sidecar.get("lyrics_hint") or singing_cfg.get("lyrics_hint") or ""
+        tr = self.translator.translate_lyrics(
+            text=src,
+            source_lang=src_lang,
+            target_lang=target_lang,
+            emotion=emo,
+            title=title,
+            hint=hint,
+            emotion_intensity=emo_i,
+            emotion_valence=emo_v,
+        )
+        self._distribute_translation(tr.translated_text, segments)
+        ok_n = sum(1 for s in segments if (s.get("tgt") or "").strip())
+        return tr, ok_n
+
+    def _ensure_longest_segment_translated(
+        self,
+        segments,
+        merge_groups,
+        src_lang,
+        target_lang,
+        emo,
+        emo_i,
+        emo_v,
+    ) -> bool:
+        """G3: 最长源段若仍空译, 对该合并组再译一次。"""
+        if not segments:
+            return False
+        best_i = 0
+        best_dur = -1.0
+        for i, seg in enumerate(segments):
+            onset = float(seg.get("onset", seg.get("start", 0)))
+            offset = float(seg.get("offset", seg.get("end", onset)))
+            dur = offset - onset
+            if dur > best_dur:
+                best_dur = dur
+                best_i = i
+        seg = segments[best_i]
+        if (seg.get("tgt") or "").strip():
+            return False
+        # 找包含 best_i 的 merge group
+        group_idxs = None
+        for idxs in merge_groups:
+            if best_i in idxs:
+                group_idxs = idxs
+                break
+        if not group_idxs:
+            group_idxs = [best_i]
+        src = "".join(
+            (segments[k].get("text") or "").strip() for k in group_idxs
+        ).strip()
+        if not src:
+            return False
+        seg_emo = segments[group_idxs[0]].get("emotion", emo)
+        tgt = self._translate_segment_text(
+            src, src_lang, target_lang, seg_emo, emo_i, emo_v
+        )
+        if not tgt:
+            return False
+        for k in group_idxs:
+            segments[k]["tgt"] = ""
+        segments[group_idxs[0]]["tgt"] = tgt
+        logger.info(f"  G3 longest-seg translate ok ({best_dur:.1f}s)")
+        return True
+
+    def _finalize_run_status(self, result: PipelineResult) -> str:
+        """G3/G6: length 与逐段译覆盖率门禁。"""
+        qcfg = self.config.get("pipeline", {}).get("quality", {})
+        lo = float(qcfg.get("length_ratio_min_success", 0.8))
+        hi = float(qcfg.get("length_ratio_max_success", 1.15))
+        min_ratio = float(qcfg.get("min_per_seg_translate_ratio", 0.95))
+        issues = []
+        trans = result.translation_result
+        if trans is not None:
+            if trans.length_ratio < lo:
+                issues.append(f"length_ratio={trans.length_ratio:.2f}<{lo}")
+            elif trans.length_ratio > hi:
+                issues.append(f"length_ratio={trans.length_ratio:.2f}>{hi}")
+        per_r = float(result.quality_meta.get("per_seg_translate_ratio", 1.0))
+        if result.asr_result and len(result.asr_result.segments) > 0:
+            if per_r < min_ratio:
+                issues.append(f"per_seg_ok={per_r:.2f}<{min_ratio}")
+        if issues:
+            result.quality_meta["degraded_reasons"] = issues
+            logger.warning(f"Run degraded: {'; '.join(issues)}")
+            return "degraded"
+        return "success"
 
     def _translate_segment_text(
         self, src, src_lang, target_lang, seg_emo, emo_i, emo_v
@@ -649,7 +1066,7 @@ class CrossLingualPipeline:
         """
         if not segments:
             return
-        asr_cfg = self.config.get("asr", {})
+        asr_cfg = self._active_asr_cfg()
         crumb_max = int(asr_cfg.get("crumb_max_chars", 4))
         gap_th = float(asr_cfg.get("merge_gap_seconds", 0.5))
         i = 1
@@ -766,7 +1183,7 @@ class CrossLingualPipeline:
         """
         if not segments:
             return []
-        asr_cfg = self.config.get("asr", {})
+        asr_cfg = self._active_asr_cfg()
         gap_th = float(asr_cfg.get("merge_gap_seconds", 0.35))
         short_chars = int(asr_cfg.get("merge_short_chars", 8))
         crumb_max = int(asr_cfg.get("crumb_max_chars", 4))
@@ -843,9 +1260,24 @@ class CrossLingualPipeline:
         按 (说话人, 语气桶) 分组 —— 换语气或换说话人才切分新组。
         同一组内的所有分段一次克隆整段话, 中间用标点控制停顿。
         """
+        if getattr(self, "_run_domain", "") == "singing":
+            # P2: 清唱按金标/ASR 句级分段各自克隆, 组间 gap 对齐源静音
+            groups = []
+            for seg in segments:
+                spk = seg.get("speaker", "SPEAKER_00")
+                emo = seg.get("emotion", "sad")
+                groups.append({"spk": spk, "emotion": emo, "segs": [seg]})
+            return groups
+
         cfg = self.config.get("pipeline", {}).get("segment", {})
         min_group_segments = int(cfg.get("min_group_segments", 2))
         use_bucket = bool(cfg.get("emotion_bucket", True))
+        if getattr(self, "_run_domain", "") == "singing":
+            singing_cfg = self.config.get("pipeline", {}).get("singing", {})
+            min_group_segments = int(
+                singing_cfg.get("min_group_segments", min_group_segments)
+            )
+            use_bucket = False
 
         groups = []
         for seg in segments:
@@ -997,6 +1429,15 @@ class CrossLingualPipeline:
             seg_emo = seg.get("emotion_bucket") or seg.get("emotion")
             if prefer_emo and seg_emo and prefer_emo == seg_emo and prefer_emo != "neutral":
                 q_score += 1.5
+            # P2: 清唱优先前半段稳定乐句作参考
+            if getattr(self, "_run_domain", "") == "singing":
+                singing_cfg = self.config.get("pipeline", {}).get("singing", {})
+                if singing_cfg.get("prefer_early_reference", True):
+                    total_dur = len(audio) / max(sr, 1)
+                    mid = (onset + offset) / 2.0
+                    dur = offset - onset
+                    if mid < total_dur * 0.55 and 3.0 <= dur <= 8.0:
+                        q_score += 2.0
             ranked.append((q_score, q, seg, clip, onset, offset))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
@@ -1160,6 +1601,22 @@ class CrossLingualPipeline:
                      f"克隆引擎: {clone.get('engine', '?')} | supports_clone={clone.get('supports_voice_clone', '?')}",
                      f"整体情感: {emotion}",
                      f"克隆分组数: {len(groups)}"]
+            qmeta = result.quality_meta or {}
+            if qmeta.get("domain"):
+                lines.append(f"场景域: {qmeta.get('domain')} | prompt_profile={qmeta.get('prompt_profile', '?')}")
+            if qmeta.get("translation_engine"):
+                lines.append(
+                    f"翻译引擎: {qmeta.get('translation_engine')} "
+                    f"backend={qmeta.get('translation_backend', qmeta.get('translation_engine'))} "
+                    f"mode={qmeta.get('translation_mode', 'segment')}"
+                )
+            ameta = result.asr_meta or {}
+            if ameta:
+                lines.append(
+                    f"ASR: model={ameta.get('model_name', '?')} "
+                    f"retry={ameta.get('asr_prompt_retry', False)} "
+                    f"halluc_score={ameta.get('asr_hallucination_score', 0):.2f}"
+                )
             if diar.get("warning"):
                 lines.append(f"分离警告: {diar['warning']}")
             if speaker_ref_meta:
@@ -1174,6 +1631,9 @@ class CrossLingualPipeline:
                 lines.append(f"源音节: {trans.source_syllables} | 目标音节: {trans.target_syllables} | 长度比: {trans.length_ratio:.2f}")
             if result.timeline_result is not None:
                 lines.append(f"时间轴: {len(result.timeline_result.speech_segments)} 说话段, 同步分 {result.timeline_result.sync_score:.2f}")
+            if qmeta.get("degraded_reasons"):
+                lines.append(f"质量告警: {'; '.join(qmeta['degraded_reasons'])}")
+            lines.append(f"运行状态: {result.status}")
             with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
 
@@ -1227,6 +1687,30 @@ class CrossLingualPipeline:
                         for g in groups
                     ],
                 }, f, ensure_ascii=False, indent=2)
+
+            # A2: AOCP 开闭段可观测输出
+            if result.aocp_result is not None:
+                aocp_payload = {
+                    "checkpoint": self.config.get("alignment", {}).get("aocp", {}).get("checkpoint"),
+                    "fallback": "energy_vad" if not self.config.get("alignment", {}).get("aocp", {}).get("checkpoint") else "aocp_net",
+                    "state_segments": result.aocp_result.state_segments,
+                    "open_ratio": round(
+                        sum(1 for s in result.aocp_result.state_segments if s.get("state") == "open")
+                        / max(len(result.aocp_result.state_segments), 1),
+                        3,
+                    ),
+                }
+                with open(os.path.join(output_dir, "aocp_open_segments.json"), "w", encoding="utf-8") as f:
+                    json.dump(aocp_payload, f, ensure_ascii=False, indent=2)
+
+            if result.timeline_result is not None:
+                tl = result.timeline_result
+                with open(os.path.join(output_dir, "timeline_sync.json"), "w", encoding="utf-8") as f:
+                    json.dump({
+                        "sync_score": tl.sync_score,
+                        "speech_segments": tl.speech_segments,
+                    }, f, ensure_ascii=False, indent=2)
+
             logger.info(f"   结果文件已写入: {output_dir}")
         except Exception as e:
             logger.warning(f"   结果文件写入失败: {str(e)[:120]}")
@@ -1484,6 +1968,7 @@ class CrossLingualPipeline:
         out_dur = len(full) / clone_sr
 
         # 7) 落盘结果 (翻译/分段/摘要)
+        result.status = self._finalize_run_status(result)
         self._save_artifacts(
             output_dir, result, asr_segments, groups,
             result.source_duration, out_dur, target_lang,

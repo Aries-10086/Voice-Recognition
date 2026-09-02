@@ -12,7 +12,7 @@ system:
 
 # ---------- ASR 语音识别 ----------
 asr:
-  engine: "faster_whisper"
+  engine: "faster_whisper"        # 清唱实测 Whisper > FunASR；说话也可用
   model_name: "medium"            # CPU 友好; GPU 可改 large-v3
   compute_type: "int8"
   device: "cpu"                   # cuda / cpu (run_pipeline --device 会覆盖)
@@ -26,6 +26,19 @@ asr:
   # 领域提示: 只声明场景, 不要写具体主题句 (否则弱音/嘈杂时 Whisper 会整段复读提示词)
   # 反例: 「讨论科技、气候、河流与历史」曾导致千夏等人声被幻觉成该句循环
   initial_prompt: "这是一段中文口语对话，请准确转写说话内容。"
+  # S1/G2: prompt 三档 (neutral | singing | fleurs_dialog)
+  prompt_profile: neutral
+  prompt_profiles: {}   # 可覆盖内置 singing 参数
+  # 真 ASR 通过线（无歌词 hint）
+  singing_pass_keyword_rate: 0.70
+  singing_pass_bigram: 0.35
+  hallucination_guard:
+    enabled: true
+    overlap_threshold: 0.45
+    banned_phrases:
+      - "讨论科技、气候、河流与历史"
+      - "讨论科技、气候、河流"
+      - "科技、气候、河流与历史"
   vad_filter: true
   min_silence_ms: 250             # VAD 静音阈值, 越小切段越碎
   speech_pad_ms: 120
@@ -47,10 +60,31 @@ asr:
     - ["不可预测的风景", "不可预测的气候"]
     - ["不可預測的風景", "不可预测的气候"]
   hotwords: ["说话人分离", "语音克隆", "水管", "气候"]
+  # 清唱常见误识对 (P1 · 如果爱忘了样例)
+  singing_corrections:
+    - ["想爱过", "如果爱忘了"]
+    - ["如果是爱了", "要是忘了"]
+    - ["分开月灯", "分开的话"]
+    - ["加你的发", "你的发"]
+    - ["加你的", "你的"]
+    - ["想遇个不了", "相遇不了"]
+    - ["想遇个", "相遇"]
+    - ["一硬地动", "隐隐地震"]
+    - ["在那个时间", "在那个瞬间"]
+    - ["必须要处理", "必须要坚强"]
+    - ["已没家", "已没有家"]
+    - ["淚不剩落下", "泪不想落下"]
+    - ["泪不剩落下", "泪不想落下"]
+    - ["幸福提升大家", "幸福啊 让她给我吧"]
+    - ["根本吸不掉", "根本洗不掉"]
+  lexicon_broadcast: "data/lexicon_broadcast.txt"
   # FunASR 配置
   funasr_model: "iic/SenseVoiceSmall"
-  vad_model: "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
-  punc_model: "iic/punc_ct-transformer_cn-en-common-vocab471067-large"
+  # 清唱对比建议关闭（避免额外下载大模型）; 对白需要时可开
+  vad_model: null
+  punc_model: null
+  # 可选本地路径（SenseVoice 已下时优先）:
+  # funasr_model: "/Users/mac/.cache/modelscope/models/iic--SenseVoiceSmall/snapshots/master"
 
 # ---------- 语种识别 ----------
 language_id:
@@ -67,12 +101,17 @@ emotion:
 
 # ---------- LLM 翻译优化 ----------
 translation:
-  engine: "google"           # google(免费可靠) / local / openai_compatible
+  engine: "google"           # google / local / openai_compatible / auto
   model_name: "Qwen/Qwen2.5-0.5B-Instruct"
   api_base: "http://localhost:8000/v1"
   temperature: 0.3
   max_tokens: 512
   emotion_weight: 0.3
+  cache_dir: "./models/huggingface/hub"
+  # C4 歌词英文硬伤修复 (regex → replacement)
+  singing_glossary:
+    - ["\\bthose happiness\\b", "those happy times"]
+    - ["\\bseparate the moonlight\\b", "time to say goodbye"]
   # F4: 音节长度比约束 (目标/源)
   length_ratio_min: 0.8
   length_ratio_max: 1.15          # 略收紧, 避免段级贴边汇总后 >1.2
@@ -160,6 +199,7 @@ pipeline:
     max_speakers: 8
     min_speakers: 1
     expected_speakers: 2        # 对白验收: 段数足够时至少拆成 2 人; 独白改为 1
+    assume_single_speaker: false  # 清唱模式可自动开启 (见 singing 块)
     # 越小分得越细
     distance_threshold: 0.40
     retry_split_min_segments: 2 # 段数≥此值且人数不足时期望二次拆分
@@ -171,6 +211,23 @@ pipeline:
     refine_by_embedding: true   # F2: KMeans 段级重标 + label_confidence
     turn_taking_correct: true   # O3: 静音轮次 + 交替校正
     turn_gap_seconds: 0.35      # 超过该静音视为换人话轮
+
+  # S1: 清唱模式默认行为 (prompt_profile=singing 时生效)
+  singing:
+    assume_single_speaker: true
+    expected_speakers: 1
+    domain: singing
+    default_emotion: sad
+    min_group_segments: 1
+    prefer_early_reference: true
+    merge_lyrics_translate: true
+    # 真 ASR KPI：CLI --no-lyrics-hint / --generic-asr-refine
+
+  # G3: 质量门禁
+  quality:
+    length_ratio_min_success: 0.8
+    length_ratio_max_success: 1.15
+    min_per_seg_translate_ratio: 0.95
 
   # 分段合成 (整段克隆 + 停顿控制)
   segment:

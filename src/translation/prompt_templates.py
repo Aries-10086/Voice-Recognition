@@ -42,6 +42,24 @@ Translate to {target_lang}, matching vowel rhythm and syllable count:"""
 
 只返回优化后的文本。"""
 
+    # 清唱歌词意译 (C4 / S5)
+    SINGING_LYRICS_TEMPLATE = """You are translating song lyrics from {source_lang} to {target_lang} for dubbing/singing.
+
+Song title: {title}
+Lyric context: {hint}
+Emotional tone: {emotion} (poetic, singable English)
+
+Rules:
+1. Prefer natural lyric phrasing over word-for-word translation
+2. Avoid broken grammar (e.g. "those happiness" → "those happy times")
+3. Keep syllable count roughly close to source ({syllable_count} syllables) for lip-sync
+4. Preserve key imagery: love, tears, memory, parting, longing
+
+Source lyrics:
+{source_text}
+
+Output ONLY the English lyric translation, no notes."""
+
     # 多句段批量翻译
     BATCH_TRANSLATION_TEMPLATE = """请将以下{source_lang}文本翻译为{target_lang}。
 整体情感基调: {emotion}

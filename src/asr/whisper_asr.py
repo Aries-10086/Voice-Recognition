@@ -5,7 +5,7 @@ Whisper ASR 模块 - 多语种语音识别
 
 import numpy as np
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loguru import logger
 
 
@@ -17,6 +17,7 @@ class ASRResult:
     segments: List[Dict]  # 含时间戳的词/段信息
     duration: float       # 音频时长(秒)
     confidence: float     # 整体置信度
+    meta: Dict = field(default_factory=dict)
 
 
 class WhisperASR:
@@ -35,7 +36,24 @@ class WhisperASR:
         self.engine_name = config.get("engine", "faster_whisper")
         self.model = None
         self.processor = None
+        self._loaded_model_name = None
         self._load_model()
+
+    def reload_if_needed(self, config: Dict) -> None:
+        """profile / 引擎切换时热重载。"""
+        new_engine = config.get("engine", self.engine_name)
+        if new_engine == "funasr":
+            new_name = config.get("funasr_model", "iic/SenseVoiceSmall")
+        else:
+            new_name = config.get("model_name", "medium")
+        need = (
+            new_engine != self.engine_name
+            or new_name != self._loaded_model_name
+        )
+        if need:
+            self.config = dict(config)
+            self.engine_name = new_engine
+            self._load_model()
 
     def _load_model(self):
         """加载ASR模型"""
@@ -78,6 +96,7 @@ class WhisperASR:
             if cpu_threads > 0:
                 kwargs["cpu_threads"] = cpu_threads
             self.model = WhisperModel(**kwargs)
+            self._loaded_model_name = model_name
             logger.info(f"faster-whisper loaded: {model_name} ({device})")
         except Exception as e:
             logger.error(f"❌ faster-whisper 加载失败: {e}")
@@ -92,14 +111,28 @@ class WhisperASR:
             )
             vad_model = self.config.get("vad_model", None)
             punc_model = self.config.get("punc_model", None)
+            raw_device = str(self.config.get("device", "cpu"))
+            # FunASR: cpu / cuda:0
+            if raw_device in ("cpu", "mps"):
+                device = "cpu"
+            elif raw_device.startswith("cuda"):
+                device = raw_device if ":" in raw_device else "cuda:0"
+            else:
+                device = "cpu"
 
-            self.model = AutoModel(
+            kwargs = dict(
                 model=model_name,
-                vad_model=vad_model,
-                punc_model=punc_model,
-                device=self.config.get("device", "cuda:0"),
+                device=device,
+                disable_update=True,
             )
-            logger.info(f"✅ FunASR 模型加载成功: {model_name}")
+            if vad_model:
+                kwargs["vad_model"] = vad_model
+            if punc_model:
+                kwargs["punc_model"] = punc_model
+
+            self.model = AutoModel(**kwargs)
+            self._loaded_model_name = model_name
+            logger.info(f"✅ FunASR 模型加载成功: {model_name} ({device})")
         except Exception as e:
             logger.error(f"❌ FunASR 加载失败: {e}")
             raise
@@ -109,6 +142,7 @@ class WhisperASR:
         audio: np.ndarray,
         sample_rate: int = 16000,
         language: Optional[str] = None,
+        asr_config: Optional[Dict] = None,
     ) -> ASRResult:
         """
         执行语音识别
@@ -117,41 +151,95 @@ class WhisperASR:
             audio: 音频波形 (numpy array, shape=(n_samples,))
             sample_rate: 采样率
             language: 指定语言 (None=自动检测)
+            asr_config: 本次转写生效配置 (含 profile 合并结果); None 用 self.config
 
         Returns:
             ASRResult 识别结果
         """
+        cfg = asr_config if asr_config is not None else self.config
         if self.engine_name == "faster_whisper":
-            return self._transcribe_whisper(audio, sample_rate, language)
+            return self._transcribe_whisper(audio, sample_rate, language, cfg)
         elif self.engine_name == "funasr":
             return self._transcribe_funasr(audio, sample_rate, language)
 
     def _transcribe_whisper(
-        self, audio: np.ndarray, sample_rate: int, language: Optional[str]
+        self, audio: np.ndarray, sample_rate: int, language: Optional[str], cfg: Dict
     ) -> ASRResult:
-        """faster-whisper 转写"""
+        """faster-whisper 转写 (含 G1 幻觉护栏重试)"""
+        from src.asr.asr_profiles import apply_profile, detect_hallucination
+
+        profile = cfg.get("prompt_profile_active") or cfg.get("prompt_profile") or "neutral"
+        guard = cfg.get("hallucination_guard") or {}
+        guard_on = bool(guard.get("enabled", True))
+        banned = guard.get("banned_phrases")
+        overlap_th = float(guard.get("overlap_threshold", 0.45))
+
+        meta = {
+            "prompt_profile": profile,
+            "asr_prompt_retry": False,
+            "asr_hallucination_score": 0.0,
+            "asr_hallucination_reason": "ok",
+            "model_name": cfg.get("model_name", "medium"),
+        }
+
+        result = self._transcribe_whisper_once(audio, sample_rate, language, cfg, meta)
+        if not guard_on or profile == "singing":
+            # 清唱 profile 不做「无 prompt」降级 (需要歌词提示)
+            return result
+
+        prompt_used = cfg.get("initial_prompt")
+        is_hal, score, reason = detect_hallucination(
+            result.text, prompt_used, banned, overlap_th
+        )
+        meta["asr_hallucination_score"] = score
+        meta["asr_hallucination_reason"] = reason
+        if is_hal:
+            logger.warning(
+                f"ASR 幻觉护栏触发 ({reason}, score={score:.2f}) → 无 prompt 重试"
+            )
+            retry_cfg = dict(cfg)
+            retry_cfg["initial_prompt"] = None
+            meta_retry = dict(meta)
+            meta_retry["asr_prompt_retry"] = True
+            result2 = self._transcribe_whisper_once(
+                audio, sample_rate, language, retry_cfg, meta_retry
+            )
+            is_hal2, score2, reason2 = detect_hallucination(
+                result2.text, prompt_used, banned, overlap_th
+            )
+            result2.meta["asr_hallucination_score"] = score2
+            result2.meta["asr_hallucination_reason"] = reason2
+            if not is_hal2 or len(result2.text) > len(result.text):
+                return result2
+        return result
+
+    def _transcribe_whisper_once(
+        self, audio: np.ndarray, sample_rate: int, language: Optional[str],
+        cfg: Dict, meta: Dict,
+    ) -> ASRResult:
+        """单次 faster-whisper 转写。"""
         # 确保音频为 float32
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        beam_size = self.config.get("beam_size", 1)
-        word_ts = bool(self.config.get("word_timestamps", True))
-        cond_prev = bool(self.config.get("condition_on_previous_text", False))
+        beam_size = cfg.get("beam_size", 1)
+        word_ts = bool(cfg.get("word_timestamps", True))
+        cond_prev = bool(cfg.get("condition_on_previous_text", False))
 
         # 注意: 本版本 faster-whisper 的 transcribe() 不支持 batch_size/num_workers,
         # 并行度通过 WhisperModel 构造函数的 num_workers/cpu_threads 控制。
-        lang = language or self.config.get("language") or None
-        vad_filter = bool(self.config.get("vad_filter", True))
+        lang = language or cfg.get("language") or None
+        vad_filter = bool(cfg.get("vad_filter", True))
         # 更敏感的 VAD: 便于双人对话切出更多轮次
-        vad_params = self.config.get("vad_parameters") or {
-            "min_silence_duration_ms": int(self.config.get("min_silence_ms", 250)),
-            "speech_pad_ms": int(self.config.get("speech_pad_ms", 120)),
+        vad_params = cfg.get("vad_parameters") or {
+            "min_silence_duration_ms": int(cfg.get("min_silence_ms", 250)),
+            "speech_pad_ms": int(cfg.get("speech_pad_ms", 120)),
         }
-        initial_prompt = self.config.get("initial_prompt") or None
+        initial_prompt = cfg.get("initial_prompt") or None
         # 真实中文样例: 领域提示降低幻觉; 空字符串视为未设置
         if isinstance(initial_prompt, str) and not initial_prompt.strip():
             initial_prompt = None
-        temperature = self.config.get("temperature", 0.0)
+        temperature = cfg.get("temperature", 0.0)
         transcribe_kwargs = dict(
             language=lang,
             beam_size=beam_size,
@@ -175,7 +263,7 @@ class WhisperASR:
         segments = []
         full_text = []
         for seg in segments_raw:
-            text = self._postcorrect_asr_text(seg.text.strip())
+            text = self._postcorrect_asr_text(seg.text.strip(), cfg)
             segments.append({
                 "start": seg.start,
                 "end": seg.end,
@@ -197,21 +285,27 @@ class WhisperASR:
 
         # P0: 按静音/句号/最大时长再切段, 避免双人对话被合成大段
         n_before = len(segments)
-        segments = self._refine_segments(audio, sample_rate, segments)
+        segments = self._refine_segments(audio, sample_rate, segments, cfg)
         if len(segments) != n_before:
             logger.info(f"ASR refine: {n_before} -> {len(segments)} segments")
 
+        out_meta = dict(meta)
         result = ASRResult(
             text=" ".join(full_text),
             language=info.language,
             segments=segments,
             duration=info.duration,
             confidence=confidence,
+            meta=out_meta,
         )
-        logger.info(f"ASR: lang={result.language}, segs={len(segments)}, text={result.text[:100]}...")
+        logger.info(
+            f"ASR: profile={out_meta.get('prompt_profile')} "
+            f"model={out_meta.get('model_name')} "
+            f"segs={len(segments)} text={result.text[:100]}..."
+        )
         return result
 
-    def _postcorrect_asr_text(self, text: str) -> str:
+    def _postcorrect_asr_text(self, text: str, cfg: Optional[Dict] = None) -> str:
         """
         轻量 ASR 后校正: 配置 hotwords / 常见误识对。
         不改变语义结构, 只做明确替换。
@@ -230,7 +324,7 @@ class WhisperASR:
             ("风的风景", "气候"),
             ("風的風景", "气候"),
         ]
-        extra = self.config.get("corrections") or []
+        extra = (cfg or self.config).get("corrections") or []
         for item in extra:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 pairs.append((str(item[0]), str(item[1])))
@@ -239,14 +333,14 @@ class WhisperASR:
         for a, b in pairs:
             if a and a in out:
                 out = out.replace(a, b)
-        hotwords = self.config.get("hotwords") or []
+        hotwords = (cfg or self.config).get("hotwords") or []
         # hotwords 仅作提示日志, Whisper 无原生热词; 保留配置位
         if hotwords and out != text:
             logger.debug(f"ASR postcorrect: {text[:40]} -> {out[:40]}")
         return out
 
     def _refine_segments(
-        self, audio: np.ndarray, sr: int, segments: List[Dict]
+        self, audio: np.ndarray, sr: int, segments: List[Dict], cfg: Optional[Dict] = None
     ) -> List[Dict]:
         """
         把过粗的 ASR 段切细, 便于说话人分离:
@@ -256,9 +350,10 @@ class WhisperASR:
         """
         if not segments:
             return segments
-        min_silence = float(self.config.get("split_silence_seconds", 0.28))
-        min_seg = float(self.config.get("min_segment_seconds", 0.45))
-        max_seg = float(self.config.get("max_segment_seconds", 2.8))
+        c = cfg or self.config
+        min_silence = float(c.get("split_silence_seconds", 0.28))
+        min_seg = float(c.get("min_segment_seconds", 0.45))
+        max_seg = float(c.get("max_segment_seconds", 2.8))
 
         refined: List[Dict] = []
         for seg in segments:
@@ -667,34 +762,49 @@ class WhisperASR:
     def _transcribe_funasr(
         self, audio: np.ndarray, sample_rate: int, language: Optional[str]
     ) -> ASRResult:
-        """FunASR 转写"""
-        result = self.model.generate(
-            input=audio,
-            cache={},
-            language=language,
-        )
+        """FunASR / SenseVoice 转写"""
+        import re
+
+        if audio.dtype != np.float32:
+            audio = audio.astype(np.float32)
+
+        gen_kwargs = dict(input=audio, cache={}, language="zh", use_itn=True)
+        try:
+            result = self.model.generate(**gen_kwargs)
+        except TypeError:
+            result = self.model.generate(input=audio)
 
         if result and len(result) > 0:
             r = result[0]
-            text = r.get("text", "")
-            # FunASR返回的时间戳可能格式不同
+            text = r.get("text", "") if isinstance(r, dict) else str(r)
+            # SenseVoice 常带 <|zh|><|NEUTRAL|> 等标签
+            text = re.sub(r"<\|[^|>]+\|>", "", text or "").strip()
+            text = re.sub(r"\s{2,}", " ", text)
             segments = []
-            if "timestamp" in r:
+            if isinstance(r, dict) and "timestamp" in r:
                 for ts_item in r["timestamp"]:
                     segments.append({
                         "start": ts_item[0] / 1000.0 if ts_item[0] > 1 else ts_item[0],
                         "end": ts_item[1] / 1000.0 if ts_item[1] > 1 else ts_item[1],
                         "text": ts_item[2] if len(ts_item) > 2 else "",
                     })
+            if not segments and text:
+                # 无时间戳时整段一条，便于后续 pipeline
+                dur = len(audio) / max(sample_rate, 1)
+                segments = [{"start": 0.0, "end": dur, "text": text}]
 
-            result = ASRResult(
+            out = ASRResult(
                 text=text,
                 language=language or "zh",
                 segments=segments,
                 duration=len(audio) / sample_rate,
                 confidence=0.9,
+                meta={
+                    "prompt_profile": self.config.get("prompt_profile_active", "neutral"),
+                    "model_name": self.config.get("funasr_model", "SenseVoiceSmall"),
+                    "engine": "funasr",
+                },
             )
-            logger.info(f"📝 FunASR结果: text={result.text[:100]}...")
-            return result
-        else:
-            return ASRResult(text="", language="unknown", segments=[], duration=0, confidence=0)
+            logger.info(f"FunASR: text={out.text[:120]}...")
+            return out
+        return ASRResult(text="", language="unknown", segments=[], duration=0, confidence=0)

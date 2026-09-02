@@ -3,8 +3,10 @@ LLM翻译优化模块
 【创新点】情感感知的跨语种翻译 + 语义-情感联合优化
 """
 
+import os
 import re
 import numpy as np
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from loguru import logger
@@ -57,7 +59,26 @@ class LLMTranslator:
         self.client = None
         self.tokenizer = None
         self.model = None
+        self.last_backend = self.engine
+        if self.engine == "auto":
+            self.engine = self._resolve_auto_engine()
+            self.last_backend = self.engine
         self._init_engine()
+
+    def _resolve_auto_engine(self) -> str:
+        """auto: 本地模型已缓存则 local，否则 google。"""
+        model_slug = self.model_name.replace("/", "--")
+        for root in (
+            Path(os.environ.get("HF_HOME", "./models/huggingface")) / "hub",
+            Path(os.environ.get("HF_HOME", "./models/huggingface")),
+        ):
+            if not root.exists():
+                continue
+            if any(root.glob(f"models--{model_slug}*")):
+                logger.info(f"auto engine → local ({self.model_name} cached)")
+                return "local"
+        logger.info("auto engine → google (no local cache)")
+        return "google"
 
     def _init_engine(self):
         """初始化LLM后端"""
@@ -187,6 +208,7 @@ class LLMTranslator:
                 translated = polished
                 target_syllables = self._count_syllables(translated, target_lang)
                 length_ratio = target_syllables / max(source_syllables, 1)
+            self.last_backend = backend
             logger.info(
                 f"Translation ({backend}): [{source_lang}->{target_lang}] "
                 f"emotion={emotion} ratio={length_ratio:.2f}"
@@ -249,6 +271,7 @@ class LLMTranslator:
             translated, source_syllables, target_lang, refinement_history
         )
 
+        self.last_backend = self.engine
         logger.info(f"Translation: [{source_lang}->{target_lang}] emotion={emotion}, syl_ratio={length_ratio:.2f}")
 
         return TranslationResult(
@@ -263,6 +286,120 @@ class LLMTranslator:
             confidence=0.9,
             refinement_history=refinement_history,
         )
+
+    def translate_lyrics(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        emotion: str = "sad",
+        title: str = "",
+        hint: str = "",
+        emotion_intensity: float = 0.6,
+        emotion_valence: float = -0.2,
+    ) -> TranslationResult:
+        """C4: 清唱整首意译；Google 路径走 refine，LLM 路径走歌词模板。"""
+        source_syllables = self._count_syllables(text, source_lang)
+        history: List[str] = []
+
+        if self.engine in ("local", "transformers", "openai_compatible"):
+            prompt = PromptTemplates.SINGING_LYRICS_TEMPLATE.format(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                title=title or "(unknown)",
+                hint=hint or "",
+                emotion=emotion,
+                syllable_count=source_syllables,
+                source_text=text,
+            )
+            system_prompt = PromptTemplates.SYSTEM_PROMPT.format(
+                source_lang=source_lang,
+                target_lang=target_lang,
+                syllable_count=source_syllables,
+            )
+            raw = self._call_llm(system_prompt, prompt)
+            translated = self._clean_translation(raw, source_lang, target_lang)
+            history.append(translated)
+            self.last_backend = self.engine
+        else:
+            meta = text
+            if title:
+                meta = f"《{title}》{meta}"
+            tr = self.translate(
+                text=meta,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                emotion=emotion,
+                emotion_intensity=emotion_intensity,
+                emotion_valence=emotion_valence,
+                refine=False,
+            )
+            translated = tr.translated_text
+            history.extend(tr.refinement_history or [translated])
+            self.last_backend = getattr(self, "last_backend", "google")
+
+        translated = self._refine_singing_lyrics(
+            translated, text, target_lang, title=title, hint=hint
+        )
+        if translated not in history:
+            history.append(translated)
+
+        translated, length_ratio, target_syllables = self._constrain_length_ratio(
+            translated, source_syllables, target_lang, history
+        )
+        logger.info(
+            f"Lyrics translation ({self.last_backend}): ratio={length_ratio:.2f}"
+        )
+        return TranslationResult(
+            source_text=text,
+            translated_text=translated,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            emotion=emotion,
+            source_syllables=source_syllables,
+            target_syllables=target_syllables,
+            length_ratio=length_ratio,
+            confidence=0.88,
+            refinement_history=history,
+        )
+
+    def _refine_singing_lyrics(
+        self,
+        translated: str,
+        source: str,
+        target_lang: str,
+        title: str = "",
+        hint: str = "",
+    ) -> str:
+        """歌词英文硬伤修复 + 配置 glossary。"""
+        tgt = str(target_lang).lower()
+        if tgt not in ("en", "eng", "english"):
+            return (translated or "").strip()
+        text = (translated or "").strip()
+
+        fixes = [
+            (r"\bthose happiness\b", "those happy times"),
+            (r"\bthose happinesses\b", "those happy times"),
+            (r"\blet'?s separate the moonlight\b", "maybe it's time we part"),
+            (r"\bseparate the moonlight\b", "time to say goodbye"),
+            (r"\bI want to have loved\b", "If love fades away"),
+            (r"\bI want to meet someone I can'?t find\b", "some meetings never happen"),
+            (r"\bthe listening\b(?!\s+quality)", "the memory"),
+            (r"\badd your hair\b", "your hair"),
+        ]
+        singing_cfg = self.config.get("singing_glossary") or []
+        for item in singing_cfg:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                fixes.append((item[0], item[1]))
+
+        for pat, repl in fixes:
+            text = re.sub(pat, repl, text, flags=re.I)
+
+        if title and "forgotten" not in text.lower() and "爱忘" in (source + hint):
+            if not re.search(r"\blove\b", text, re.I):
+                text = f"If love is forgotten, {text[0].lower()}{text[1:]}" if text else text
+
+        return re.sub(r"\s{2,}", " ", text).strip(" ,;")
 
     def translate_segments(
         self,

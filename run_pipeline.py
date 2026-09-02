@@ -160,6 +160,50 @@ def main():
         "--verbose", "-v", action="store_true",
         help="详细日志输出"
     )
+    parser.add_argument(
+        "--prompt-profile",
+        choices=["neutral", "singing", "fleurs_dialog"],
+        default=None,
+        help="ASR 提示 profile (清唱用 singing)",
+    )
+    parser.add_argument(
+        "--singing", action="store_true",
+        help="清唱模式 (= --prompt-profile singing)",
+    )
+    parser.add_argument(
+        "--assume-single-speaker", action="store_true",
+        help="强制单人分轨/克隆 (清唱推荐)",
+    )
+    parser.add_argument(
+        "--multi-speaker", action="store_true",
+        help="清唱也启用多人分离 (覆盖 singing 默认单人)",
+    )
+    parser.add_argument(
+        "--no-gold", action="store_true",
+        help="忽略 .gold.json 旁路，强制走 ASR（测清唱识别）",
+    )
+    parser.add_argument(
+        "--asr-engine",
+        choices=["faster_whisper", "funasr"],
+        default=None,
+        help="覆盖 ASR 引擎 (清唱对比可用 funasr)",
+    )
+    parser.add_argument(
+        "--no-lyrics-hint",
+        action="store_true",
+        help="清唱 ASR 真能力：不用歌名/歌词 hint、不用歌曲纠错表",
+    )
+    parser.add_argument(
+        "--generic-asr-refine",
+        action="store_true",
+        help="Whisper 后用通用 LLM 修同音错字（不注入歌词）",
+    )
+    parser.add_argument(
+        "--translate-engine",
+        choices=["google", "local", "openai_compatible", "auto"],
+        default=None,
+        help="覆盖 translation.engine (A1: local/auto 走 LLM 主路径)",
+    )
 
     args = parser.parse_args()
 
@@ -175,6 +219,24 @@ def main():
         config.setdefault("asr", {})["device"] = args.device
         # 展平给 pipeline 里少数直接读 config["device"] 的地方
         config["device"] = args.device
+
+    prompt_profile = args.prompt_profile
+    if args.singing:
+        prompt_profile = "singing"
+    if prompt_profile:
+        config.setdefault("asr", {})["prompt_profile"] = prompt_profile
+
+    if args.translate_engine:
+        config.setdefault("translation", {})["engine"] = args.translate_engine
+
+    if args.asr_engine:
+        config.setdefault("asr", {})["engine"] = args.asr_engine
+
+    assume_single = None
+    if args.assume_single_speaker:
+        assume_single = True
+    elif args.multi_speaker:
+        assume_single = False
 
     # 检查输入文件
     if not os.path.exists(args.input):
@@ -204,10 +266,15 @@ def main():
         target_lang=args.target_lang,
         reference_audio_path=args.ref_audio,
         output_dir=args.output,
+        prompt_profile=prompt_profile,
+        assume_single_speaker=assume_single,
+        skip_gold=args.no_gold,
+        no_lyrics_hint=args.no_lyrics_hint,
+        generic_asr_refine=args.generic_asr_refine,
     )
 
     # 视频: 替换音轨
-    if video_output and result.status == "success":
+    if video_output and result.status in ("success", "degraded"):
         import subprocess
         wav_path = os.path.join(args.output or "./outputs", "cloned_output.wav")
         logger.info(f"Replacing audio in video -> {video_output}")
@@ -217,8 +284,8 @@ def main():
                       capture_output=True, check=True)
         logger.info(f"Video output: {video_output}")
 
-    if result.status == "success":
-        logger.info(f"Done: {result.processing_time:.1f}s")
+    if result.status in ("success", "degraded"):
+        logger.info(f"Done: {result.processing_time:.1f}s ({result.status})")
     else:
         logger.error(f"Failed: {result.error_message}")
         sys.exit(1)
