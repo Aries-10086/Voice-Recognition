@@ -176,6 +176,17 @@ python scripts/batch_acceptance.py --collect-only
 
 ---
 
+## 🖥️ Web 演示控制台
+
+```bash
+python scripts/run_web.py
+# 打开 http://127.0.0.1:8765
+```
+
+上传音频/视频或点「一键样例」，可看 ASR / 译文 / sync，并播放克隆音视频。详见 [`web/README.md`](web/README.md)。
+
+---
+
 ## 📊 技术栈
 
 | 组件 | 技术选型 | 版本/年份 |

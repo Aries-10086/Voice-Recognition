@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VOICECLONE · 跨语种复刻台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+  <header class="top">
+    <div class="brand">VOICECLONE</div>
+    <p class="tag">跨语种语音翻译与原声复刻</p>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h1 class="hero-title">把一段声音，<br />换成另一种语言里的「同一个人」。</h1>
+      <p class="hero-lead">上传口播或视频，自动完成识别、翻译、时间轴与声纹克隆。下方即可试跑仓库样例。</p>
+      <div class="hero-cta">
+        <label class="btn primary file-btn">
+          选择音频 / 视频
+          <input id="fileInput" type="file" accept="audio/*,video/*,.wav,.mp3,.mp4,.mkv,.webm" hidden />
+        </label>
+        <button type="button" class="btn ghost" id="runBtn" disabled>开始处理</button>
+      </div>
+      <p class="file-name" id="fileName">尚未选择文件</p>
+    </section>
+
+    <section class="panel" id="controls">
+      <h2 class="panel-title">运行参数</h2>
+      <div class="grid-form">
+        <label>目标语言
+          <select id="targetLang">
+            <option value="zh">中文 zh</option>
+            <option value="en" selected>英语 en</option>
+            <option value="ja">日语 ja</option>
+            <option value="ko">韩语 ko</option>
+          </select>
+        </label>
+        <label>源语言（可空=自动）
+          <select id="sourceLang">
+            <option value="">自动 / 文件名启发</option>
+            <option value="zh">中文</option>
+            <option value="en">英语</option>
+          </select>
+        </label>
+        <label>ASR Profile
+          <select id="profile">
+            <option value="">默认</option>
+            <option value="neutral">neutral 说话</option>
+            <option value="video_talking">video_talking 视频口播</option>
+            <option value="singing">singing 清唱</option>
+            <option value="fleurs_dialog">fleurs_dialog</option>
+          </select>
+        </label>
+        <label>设备
+          <select id="device">
+            <option value="cpu" selected>cpu</option>
+            <option value="mps">mps</option>
+            <option value="cuda">cuda</option>
+          </select>
+        </label>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="assumeSingle" checked /> 单说话人</label>
+        <label><input type="checkbox" id="singing" /> 清唱模式</label>
+        <label><input type="checkbox" id="noGold" checked /> 真 ASR（忽略 gold）</label>
+        <label><input type="checkbox" id="noLyricsHint" /> 无歌词 hint</label>
+        <label><input type="checkbox" id="forceVideo" /> 按视频处理</label>
+      </div>
+    </section>
+
+    <section class="panel samples">
+      <h2 class="panel-title">一键样例</h2>
+      <div class="sample-row" id="sampleList">
+        <p class="muted">加载样例中…</p>
+      </div>
+    </section>
+
+    <section class="panel status-panel" id="statusPanel" hidden>
+      <h2 class="panel-title">任务状态</h2>
+      <div class="status-line">
+        <span class="pill" id="statusPill">queued</span>
+        <span id="statusMsg"></span>
+      </div>
+      <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+      <p class="muted mono" id="jobId"></p>
+    </section>
+
+    <section class="panel result-panel" id="resultPanel" hidden>
+      <h2 class="panel-title">结果</h2>
+      <div class="metrics" id="metrics"></div>
+      <div class="text-blocks">
+        <article>
+          <h3>识别</h3>
+          <p id="asrText" class="block-text"></p>
+        </article>
+        <article>
+          <h3>译文</h3>
+          <p id="trText" class="block-text"></p>
+        </article>
+      </div>
+      <div class="players">
+        <div>
+          <h3>克隆音频</h3>
+          <audio id="audioPlayer" controls></audio>
+          <a id="wavLink" class="link" href="#" download>下载 wav</a>
+        </div>
+        <div id="videoWrap" hidden>
+          <h3>克隆视频</h3>
+          <video id="videoPlayer" controls playsinline></video>
+          <a id="videoLink" class="link" href="#" download>下载 mp4</a>
+        </div>
+      </div>
+      <details class="summary-box">
+        <summary>运行摘要</summary>
+        <pre id="summaryPre"></pre>
+      </details>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>本地演示控制台 · 不上传公网</span>
+    <span id="healthHint" class="muted"></span>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
