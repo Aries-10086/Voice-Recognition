@@ -120,11 +120,21 @@ class EmotionRecognizer:
         Returns:
             EmotionResult 情感分析结果
         """
-        if self.engine == "emotion2vec":
-            return self._recognize_emotion2vec(audio, sample_rate, return_timeline)
-        else:
+        try:
+            if self.engine == "emotion2vec":
+                return self._recognize_emotion2vec(audio, sample_rate, return_timeline)
             return self._recognize_wav2vec2(audio, sample_rate, return_timeline)
-
+        except Exception as e:
+            logger.warning(f"⚠️ 情感识别失败，回落 neutral: {e}")
+            return EmotionResult(
+                emotion="neutral",
+                scores={e: 0.0 for e in self.EMOTION_CATEGORIES},
+                embedding=np.zeros(self.embedding_dim, dtype=np.float32),
+                intensity=0.0,
+                valence=0.0,
+                arousal=0.5,
+                timeline=[],
+            )
     def _recognize_emotion2vec(
         self, audio: np.ndarray, sample_rate: int, return_timeline: bool
     ) -> EmotionResult:
@@ -138,14 +148,38 @@ class EmotionRecognizer:
         if result and len(result) > 0:
             r = result[0]
 
-            # 获取情感标签和分数
-            if "labels" in r:
-                emotion = r["labels"]
-                scores_dict = {e: r.get("scores", [1.0])[0] if i == 0 else 0.0
-                              for i, e in enumerate(self.EMOTION_CATEGORIES)}
+            # 获取情感标签和分数（emotion2vec 常返回 labels=list + scores=list）
+            labels = r.get("labels")
+            scores_raw = r.get("scores")
+            if isinstance(labels, (list, tuple)) and labels:
+                if isinstance(scores_raw, (list, tuple)) and len(scores_raw) == len(labels):
+                    best_i = int(np.argmax(np.asarray(scores_raw, dtype=np.float64)))
+                    raw_emotion = labels[best_i]
+                    scores_dict = {
+                        self._normalize_emotion(str(lbl)): float(sc)
+                        for lbl, sc in zip(labels, scores_raw)
+                    }
+                else:
+                    raw_emotion = labels[0]
+                    scores_dict = {
+                        self._normalize_emotion(str(e)): (
+                            float(scores_raw[0]) if isinstance(scores_raw, (list, tuple)) and scores_raw else 1.0
+                        )
+                        if i == 0 else 0.0
+                        for i, e in enumerate(labels)
+                    }
+                emotion = self._normalize_emotion(str(raw_emotion))
+            elif "labels" in r and isinstance(labels, str):
+                emotion = self._normalize_emotion(labels)
+                scores_dict = {e: 0.0 for e in self.EMOTION_CATEGORIES}
+                scores_dict[emotion] = float(
+                    scores_raw[0] if isinstance(scores_raw, (list, tuple)) and scores_raw else 1.0
+                )
             else:
-                emotion = r.get("label", "neutral")
-                scores_dict = {e: r.get(f"{e}_score", 0.0) for e in self.EMOTION_CATEGORIES}
+                emotion = self._normalize_emotion(str(r.get("label", "neutral")))
+                scores_dict = {e: float(r.get(f"{e}_score", 0.0)) for e in self.EMOTION_CATEGORIES}
+            for cat in self.EMOTION_CATEGORIES:
+                scores_dict.setdefault(cat, 0.0)
 
             # 获取embedding
             if "feats" in r:
@@ -173,7 +207,7 @@ class EmotionRecognizer:
                     timeline.append({
                         "start": i * frame_duration,
                         "end": (i + 1) * frame_duration,
-                        "emotion": label,
+                        "emotion": self._normalize_emotion(label),
                     })
 
             return EmotionResult(
@@ -249,6 +283,9 @@ class EmotionRecognizer:
         【创新点】情感效价-唤醒度映射
         基于Russell情感环状模型,将离散情感映射到连续VA空间
         """
+        from src.utils.stability import coerce_emotion_label
+
+        key = EmotionRecognizer._normalize_emotion(coerce_emotion_label(emotion))
         mapping = {
             "neutral":    (0.0,  0.3),
             "happy":      (0.8,  0.7),
@@ -258,12 +295,14 @@ class EmotionRecognizer:
             "fearful":    (-0.6, 0.8),
             "disgusted":  (-0.7, 0.5),
         }
-        return mapping.get(emotion, (0.0, 0.5))
+        return mapping.get(key, (0.0, 0.5))
 
     @staticmethod
     def _normalize_emotion(label: str) -> str:
         """将任意情感标签归一化到本系统统一类别"""
-        l = (label or "").strip().lower()
+        from src.utils.stability import coerce_emotion_label
+
+        l = coerce_emotion_label(label).lower()
         exact = {
             "happy": "happy", "happiness": "happy", "joy": "happy", "hap": "happy",
             "sad": "sad", "sadness": "sad",

@@ -29,6 +29,27 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "initial_prompt": "这是一段中文朗读，请准确转写说话内容。",
         "condition_on_previous_text": False,
     },
+    # F9 / --video：正脸口播；默认按英文 talking-head 优化（可用 --source-lang 覆盖）
+    "video_talking": {
+        "initial_prompt": (
+            "Clear spoken English from a talking-head video. "
+            "Transcribe verbatim. Proper nouns may include Wiki Education, "
+            "Wikidata, Wikipedia, Will Kent."
+        ),
+        "condition_on_previous_text": False,
+        "language": "en",
+        "beam_size": 5,
+        "vad_filter": True,
+        "min_silence_ms": 320,
+        "speech_pad_ms": 160,
+        "split_silence_seconds": 0.45,
+        "max_segment_seconds": 5.5,
+        "min_segment_seconds": 0.6,
+        "merge_gap_seconds": 0.70,
+        "merge_max_seconds": 7.0,
+        "merge_short_chars": 28,
+        "crumb_max_chars": 8,
+    },
 }
 
 DEFAULT_BANNED_PHRASES = [

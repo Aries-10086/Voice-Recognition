@@ -1,0 +1,13 @@
+# 视频口播 / talking-head 英文专名与纠错
+# 格式: 热词单独一行；纠错用 wrong|right
+Wiki Education
+Wikidata
+Wikipedia
+Will Kent
+Wiki Ed
+Wikimedia
+Wilkent|Will Kent
+Wiki education|Wiki Education
+wiki data|Wikidata
+wiki pedia|Wikipedia
+Wikki|Wiki

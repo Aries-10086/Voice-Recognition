@@ -57,7 +57,10 @@ click>=8.1.0
 rich>=13.7.0
 einops>=0.8.0
 
-# --- 可选: 视频处理 ---
+# --- Web 演示控制台 ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
 # opencv-python>=4.10.0
 # moviepy>=1.0.3
 

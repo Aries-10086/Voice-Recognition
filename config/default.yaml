@@ -26,9 +26,10 @@ asr:
   # 领域提示: 只声明场景, 不要写具体主题句 (否则弱音/嘈杂时 Whisper 会整段复读提示词)
   # 反例: 「讨论科技、气候、河流与历史」曾导致千夏等人声被幻觉成该句循环
   initial_prompt: "这是一段中文口语对话，请准确转写说话内容。"
-  # S1/G2: prompt 三档 (neutral | singing | fleurs_dialog)
+  # S1/G2: prompt 四档 (neutral | singing | fleurs_dialog | video_talking)
   prompt_profile: neutral
-  prompt_profiles: {}   # 可覆盖内置 singing 参数
+  prompt_profiles: {}   # 可覆盖内置 singing / video_talking 参数
+  lexicon_video_en: "data/lexicon_video_en.txt"
   # 真 ASR 通过线（无歌词 hint）
   singing_pass_keyword_rate: 0.70
   singing_pass_bigram: 0.35

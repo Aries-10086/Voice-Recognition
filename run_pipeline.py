@@ -162,9 +162,9 @@ def main():
     )
     parser.add_argument(
         "--prompt-profile",
-        choices=["neutral", "singing", "fleurs_dialog"],
+        choices=["neutral", "singing", "fleurs_dialog", "video_talking"],
         default=None,
-        help="ASR 提示 profile (清唱用 singing)",
+        help="ASR 提示 profile (清唱 singing；视频口播 video_talking)",
     )
     parser.add_argument(
         "--singing", action="store_true",
@@ -199,6 +199,12 @@ def main():
         help="Whisper 后用通用 LLM 修同音错字（不注入歌词）",
     )
     parser.add_argument(
+        "--source-lang",
+        type=str,
+        default=None,
+        help="源语言代码 (en/zh/...); 指定后强制 Whisper 语种，英文片请传 en",
+    )
+    parser.add_argument(
         "--translate-engine",
         choices=["google", "local", "openai_compatible", "auto"],
         default=None,
@@ -223,6 +229,10 @@ def main():
     prompt_profile = args.prompt_profile
     if args.singing:
         prompt_profile = "singing"
+    # --video 默认走 video_talking（除非已指定 singing / 其它 profile）
+    if args.video and not prompt_profile and not args.singing:
+        prompt_profile = "video_talking"
+        logger.info("Auto ASR profile for --video: video_talking")
     if prompt_profile:
         config.setdefault("asr", {})["prompt_profile"] = prompt_profile
 
@@ -246,43 +256,95 @@ def main():
     # 导入Pipeline
     from src.integration.pipeline import CrossLingualPipeline
 
-    # 视频处理: 提取音频
+    # 视频处理: 提取音频 → 全链路 → 回贴克隆音轨
     audio_input = args.input
-    video_output = None
+    video_output_name = None
+    source_lang = args.source_lang
+    if not source_lang:
+        from src.utils.stability import infer_source_lang_from_path
+        source_lang = infer_source_lang_from_path(args.input)
+        if source_lang:
+            logger.info(f"Auto source-lang from filename: {source_lang}")
+
     if args.video:
-        import subprocess, tempfile
-        temp_audio = os.path.join(tempfile.gettempdir(), "voiceclone_temp.wav")
-        logger.info(f"Extracting audio from video...")
-        subprocess.run(["ffmpeg", "-i", args.input, "-ar", "16000", "-ac", "1",
-                       temp_audio, "-y"], capture_output=True, check=True)
+        from src.utils.video_utils import VideoUtils
+        from src.utils.audio_utils import AudioUtils
+        from src.utils.ffmpeg_bin import require_ffmpeg
+        import tempfile
+
+        try:
+            require_ffmpeg()
+        except RuntimeError as e:
+            logger.error(str(e))
+            sys.exit(1)
+
+        logger.info("Extracting audio from video...")
+        try:
+            audio_arr, audio_sr = VideoUtils.extract_audio_from_video(args.input, target_sr=16000)
+        except Exception as e:
+            logger.error(f"❌ 视频抽音失败: {e}")
+            sys.exit(1)
+        if audio_arr is None or len(audio_arr) < int(0.3 * audio_sr):
+            logger.error("❌ 视频无有效音轨或过短，无法验收/克隆")
+            sys.exit(1)
+        # 独立临时文件，避免并发/残留互相覆盖
+        fd, temp_audio = tempfile.mkstemp(prefix="voiceclone_", suffix=".wav")
+        os.close(fd)
+        AudioUtils.save_audio(audio_arr, temp_audio, audio_sr)
         audio_input = temp_audio
-        video_output = args.output or args.input.replace('.mp4','_cloned.mp4').replace('.mkv','_cloned.mkv')
+        stem = os.path.splitext(os.path.basename(args.input))[0]
+        video_output_name = f"{stem}_cloned.mp4"
 
     # 初始化Pipeline
     pipeline = CrossLingualPipeline(config)
 
-    result = pipeline.run(
-        audio_path=audio_input,
-        target_lang=args.target_lang,
-        reference_audio_path=args.ref_audio,
-        output_dir=args.output,
-        prompt_profile=prompt_profile,
-        assume_single_speaker=assume_single,
-        skip_gold=args.no_gold,
-        no_lyrics_hint=args.no_lyrics_hint,
-        generic_asr_refine=args.generic_asr_refine,
-    )
+    try:
+        result = pipeline.run(
+            audio_path=audio_input,
+            target_lang=args.target_lang,
+            reference_audio_path=args.ref_audio,
+            output_dir=args.output,
+            prompt_profile=prompt_profile,
+            assume_single_speaker=assume_single,
+            skip_gold=args.no_gold,
+            no_lyrics_hint=args.no_lyrics_hint,
+            generic_asr_refine=args.generic_asr_refine,
+            source_lang=source_lang,
+            sidecar_base_path=args.input if args.video else None,
+        )
+    finally:
+        if args.video and audio_input != args.input:
+            try:
+                os.unlink(audio_input)
+            except OSError:
+                pass
 
-    # 视频: 替换音轨
-    if video_output and result.status in ("success", "degraded"):
-        import subprocess
-        wav_path = os.path.join(args.output or "./outputs", "cloned_output.wav")
-        logger.info(f"Replacing audio in video -> {video_output}")
-        subprocess.run(["ffmpeg", "-i", args.input, "-i", wav_path,
-                       "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0",
-                       "-shortest", video_output, "-y"],
-                      capture_output=True, check=True)
-        logger.info(f"Video output: {video_output}")
+    # 视频: 用 run_* 下 cloned_output.wav 回贴（勿用 ./outputs 根目录）
+    if video_output_name and result.status in ("success", "degraded"):
+        from src.utils.video_utils import VideoUtils
+        import soundfile as sf
+
+        wav_path = result.cloned_wav_path or (
+            os.path.join(result.output_dir, "cloned_output.wav") if result.output_dir else ""
+        )
+        if not wav_path or not os.path.exists(wav_path):
+            logger.error(f"❌ 找不到克隆 wav，无法回贴视频: {wav_path!r}")
+            result.quality_meta.setdefault("degraded_reasons", []).append("video_remux_missing_wav")
+            # 音频主链已成功：不因回贴失败整链判死
+            logger.warning("音频产物仍可用；视频回贴跳过")
+        else:
+            out_mp4 = os.path.join(result.output_dir or ".", video_output_name)
+            try:
+                audio_data, audio_sr = sf.read(wav_path)
+                logger.info(f"Replacing audio in video -> {out_mp4}")
+                VideoUtils.replace_audio_in_video(args.input, audio_data, int(audio_sr), out_mp4)
+                logger.info(f"Video output: {out_mp4}")
+                result.quality_meta["video_output"] = out_mp4
+            except Exception as e:
+                logger.error(f"❌ 视频回贴失败（音频仍可用）: {e}")
+                result.quality_meta.setdefault("degraded_reasons", []).append("video_remux_failed")
+                if result.status == "success":
+                    result.status = "degraded"
 
     if result.status in ("success", "degraded"):
         logger.info(f"Done: {result.processing_time:.1f}s ({result.status})")

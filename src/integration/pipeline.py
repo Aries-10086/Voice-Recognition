@@ -97,6 +97,9 @@ class PipelineResult:
 
     # 合成结果
     cloned_speech: Optional[ClonedSpeech] = None
+    # 本次 run 落盘目录与克隆 wav（供 --video 回贴音轨）
+    output_dir: str = ""
+    cloned_wav_path: str = ""
 
     # 元数据
     processing_time: float = 0.0
@@ -191,6 +194,8 @@ class CrossLingualPipeline:
         skip_gold: bool = False,
         no_lyrics_hint: bool = False,
         generic_asr_refine: bool = False,
+        source_lang: Optional[str] = None,
+        sidecar_base_path: Optional[str] = None,
     ) -> PipelineResult:
         """
         运行完整Pipeline
@@ -216,6 +221,7 @@ class CrossLingualPipeline:
         run_stamp = time.strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(output_dir, f"run_{run_stamp}")
         os.makedirs(output_dir, exist_ok=True)
+        result.output_dir = output_dir
         logger.info(f"输出目录: {output_dir}")
 
         times = {}  # 各步骤耗时
@@ -227,8 +233,11 @@ class CrossLingualPipeline:
             result.quality_meta["no_lyrics_hint"] = self._no_lyrics_hint
             result.quality_meta["generic_asr_refine"] = self._generic_asr_refine
 
+            # 视频抽音后 audio_path 是临时文件；金标/语种启发用原视频路径
+            meta_path = sidecar_base_path or audio_path
             run_ctx = self._prepare_run_context(
-                audio_path, prompt_profile, assume_single_speaker, no_lyrics_hint
+                meta_path, prompt_profile, assume_single_speaker, no_lyrics_hint,
+                source_lang=source_lang,
             )
             effective_asr = run_ctx["effective_asr"]
             self._run_effective_asr = effective_asr
@@ -240,7 +249,7 @@ class CrossLingualPipeline:
             t1 = time.time()
             logger.info("[1/7] Loading audio...")
             audio, sr = AudioUtils.load_audio(audio_path)
-            gold = None if skip_gold else self._load_gold_transcript(audio_path)
+            gold = None if skip_gold else self._load_gold_transcript(meta_path)
             # 有金标时不要 trim_silence, 否则时间轴与 gold 错位; 且可能裁掉首句
             if gold is None:
                 audio = AudioUtils.trim_silence(audio, sr)
@@ -265,6 +274,29 @@ class CrossLingualPipeline:
                         audio, sr, asr_config=effective_asr
                     )
                     result.asr_meta = dict(result.asr_result.meta or {})
+                    # 语种/脚本明显不符时自动重跑一次（稳定性：避免英文被听成中文）
+                    from src.utils.stability import asr_lang_script_mismatch
+
+                    retry_lang = asr_lang_script_mismatch(
+                        result.asr_result.language, result.asr_result.text or ""
+                    )
+                    if retry_lang and retry_lang != (effective_asr.get("language") or ""):
+                        logger.warning(
+                            f"   ASR lang/script mismatch "
+                            f"(lang={result.asr_result.language}, retry={retry_lang}); re-ASR"
+                        )
+                        retry_cfg = dict(effective_asr)
+                        retry_cfg["language"] = retry_lang
+                        retry_cfg["initial_prompt"] = ""
+                        retry_cfg["corrections"] = []
+                        self.asr.reload_if_needed(retry_cfg)
+                        result.asr_result = self.asr.transcribe(
+                            audio, sr, asr_config=retry_cfg
+                        )
+                        result.asr_meta = dict(result.asr_result.meta or {})
+                        result.asr_meta["asr_lang_retry"] = retry_lang
+                        effective_asr = retry_cfg
+                        run_ctx["effective_asr"] = retry_cfg
                     result.asr_result = self._post_refine_asr(
                         result.asr_result,
                         run_ctx,
@@ -277,6 +309,8 @@ class CrossLingualPipeline:
                     logger.info(f"   lang: {result.detected_language}")
                     if result.asr_meta.get("asr_prompt_retry"):
                         logger.info("   ASR: prompt retry (hallucination guard)")
+                    if result.asr_meta.get("asr_lang_retry"):
+                        logger.info(f"   ASR: language retry -> {result.asr_meta['asr_lang_retry']}")
 
                 # 说话人分离 (识别不同人声; pyannote 不可用时离线聚类兜底 + 明确降级提示)
                 # 注意: 不要复用情感嵌入做说话人聚类 (情感空间会抹平音色差异)
@@ -326,11 +360,34 @@ class CrossLingualPipeline:
                 logger.info(f"   text: {result.asr_result.text[:150]}...")
 
             if self.emotion_recognizer is not None:
-                result.emotion_result = self.emotion_recognizer.recognize(audio, sr)
+                try:
+                    result.emotion_result = self.emotion_recognizer.recognize(audio, sr)
+                except Exception as e:
+                    logger.warning(f"⚠️ 整段情感识别失败，回落 neutral: {e}")
+                    from src.asr.emotion_recognition import EmotionResult
+                    result.emotion_result = EmotionResult(
+                        emotion="neutral",
+                        scores={},
+                        embedding=np.zeros(1, dtype=np.float32),
+                        intensity=0.0,
+                        valence=0.0,
+                        arousal=0.5,
+                        timeline=[],
+                    )
+                    result.quality_meta.setdefault("degraded_reasons", []).append(
+                        "emotion_fallback"
+                    )
             # F6: 段级情感提前到翻译前, 供措辞与后续分组
             if self.emotion_recognizer is not None and result.asr_result is not None:
-                seg_emos = self._segment_emotions(audio, sr, result.asr_result.segments)
+                try:
+                    seg_emos = self._segment_emotions(audio, sr, result.asr_result.segments)
+                except Exception as e:
+                    logger.warning(f"⚠️ 段级情感失败: {e}")
+                    seg_emos = {}
                 default_emo = result.emotion_result.emotion if result.emotion_result else "neutral"
+                if not isinstance(default_emo, str):
+                    from src.utils.stability import coerce_emotion_label
+                    default_emo = coerce_emotion_label(default_emo)
                 singing_cfg = self.config.get("pipeline", {}).get("singing", {})
                 if self._run_domain == "singing":
                     default_emo = singing_cfg.get("default_emotion", "sad")
@@ -339,7 +396,11 @@ class CrossLingualPipeline:
                         seg["emotion_bucket"] = self._emotion_bucket(default_emo)
                 else:
                     for i, seg in enumerate(result.asr_result.segments):
-                        seg["emotion"] = seg_emos.get(i, default_emo)
+                        emo_i = seg_emos.get(i, default_emo)
+                        if not isinstance(emo_i, str):
+                            from src.utils.stability import coerce_emotion_label
+                            emo_i = coerce_emotion_label(emo_i)
+                        seg["emotion"] = emo_i
                         seg["emotion_bucket"] = self._emotion_bucket(seg["emotion"])
             times["asr+emotion"] = time.time() - t1
             n_spk = len(set(s.get("speaker","?") for s in result.asr_result.segments)) if result.asr_result else 1
@@ -756,6 +817,7 @@ class CrossLingualPipeline:
         prompt_profile: Optional[str],
         assume_single_speaker: Optional[bool],
         no_lyrics_hint: bool = False,
+        source_lang: Optional[str] = None,
     ) -> Dict:
         """S1: 合并 prompt profile、清唱切段参数与单人分人开关。"""
         from src.asr.asr_profiles import apply_profile
@@ -768,6 +830,15 @@ class CrossLingualPipeline:
             profile = "singing"
         effective_asr, profile = apply_profile(asr_cfg, profile)
         sidecar = self._read_gold_sidecar(audio_path)
+        # 路径启发源语种（未显式传入时），避免英文片被中文 prompt 带偏
+        from src.utils.stability import infer_source_lang_from_path
+
+        path_lang = infer_source_lang_from_path(audio_path)
+        # 视频抽音后 temp 名无启发；允许调用方把原路径写在 quality 里——此处用显式 source_lang / sidecar
+        if not source_lang:
+            source_lang = sidecar.get("language") or sidecar.get("source_lang") or path_lang
+        if source_lang:
+            effective_asr["language"] = source_lang
 
         singing_cfg = self.config.get("pipeline", {}).get("singing", {})
         if profile == "singing":
@@ -792,22 +863,56 @@ class CrossLingualPipeline:
             effective_asr["_lyrics_hint"] = "" if no_lyrics_hint else hint
             effective_asr["_song_title"] = "" if no_lyrics_hint else (title or "")
             effective_asr["_no_lyrics_hint"] = no_lyrics_hint
-        elif profile == "neutral":
-            from src.asr.singing_corrector import load_lexicon_broadcast
+        elif profile in ("neutral", "video_talking"):
+            lang_l = (source_lang or effective_asr.get("language") or "").lower().split("-")[0]
+            non_zh = lang_l and lang_l not in ("zh", "yue", "chinese", "cmn")
+            if profile == "video_talking" and not lang_l:
+                lang_l = "en"
+                non_zh = True
+                effective_asr["language"] = "en"
+            if non_zh:
+                # 英文等非中文：用英文 prompt（video_talking 自带），附加专名热词
+                from src.asr.singing_corrector import load_lexicon_broadcast
 
-            lex_path = asr_cfg.get("lexicon_broadcast") or "data/lexicon_broadcast.txt"
-            lex_full = Path(lex_path) if Path(lex_path).is_absolute() else _PROJECT_ROOT / lex_path
-            hotwords, lex_pairs = load_lexicon_broadcast(str(lex_full))
-            if hotwords:
+                lex_path = (
+                    asr_cfg.get("lexicon_video_en")
+                    or "data/lexicon_video_en.txt"
+                )
+                lex_full = Path(lex_path) if Path(lex_path).is_absolute() else _PROJECT_ROOT / lex_path
+                hotwords, lex_pairs = load_lexicon_broadcast(str(lex_full))
                 prompt = (effective_asr.get("initial_prompt") or "").strip()
-                effective_asr["initial_prompt"] = (
-                    prompt + " 可能出现的专名：" + "、".join(hotwords[:12]) + "。"
-                ).strip()
-            if lex_pairs:
-                base = list(effective_asr.get("corrections") or [])
-                effective_asr["corrections"] = base + [[a, b] for a, b in lex_pairs]
+                # neutral 非中文时清掉中文 prompt
+                if profile == "neutral":
+                    prompt = ""
+                if hotwords:
+                    prompt = (
+                        (prompt + " " if prompt else "")
+                        + "Names that may appear: " + ", ".join(hotwords[:16]) + "."
+                    ).strip()
+                effective_asr["initial_prompt"] = prompt
+                if lex_pairs:
+                    base = list(effective_asr.get("corrections") or [])
+                    effective_asr["corrections"] = base + [[a, b] for a, b in lex_pairs]
+                effective_asr["_lexicon_video"] = str(lex_full)
+            else:
+                from src.asr.singing_corrector import load_lexicon_broadcast
 
-        domain = singing_cfg.get("domain", "dialog")
+                lex_path = asr_cfg.get("lexicon_broadcast") or "data/lexicon_broadcast.txt"
+                lex_full = Path(lex_path) if Path(lex_path).is_absolute() else _PROJECT_ROOT / lex_path
+                hotwords, lex_pairs = load_lexicon_broadcast(str(lex_full))
+                if hotwords:
+                    prompt = (effective_asr.get("initial_prompt") or "").strip()
+                    # video_talking 若强制中文，改用中文场景提示
+                    if profile == "video_talking" and not prompt.startswith("这是"):
+                        prompt = "这是一段视频口播，请准确转写说话内容。"
+                    effective_asr["initial_prompt"] = (
+                        prompt + " 可能出现的专名：" + "、".join(hotwords[:12]) + "。"
+                    ).strip()
+                if lex_pairs:
+                    base = list(effective_asr.get("corrections") or [])
+                    effective_asr["corrections"] = base + [[a, b] for a, b in lex_pairs]
+
+        domain = "dialog"
         assume = assume_single_speaker
         if assume is None:
             if profile == "singing":
@@ -879,12 +984,14 @@ class CrossLingualPipeline:
                 else ("singing_no_hint" if getattr(self, "_no_lyrics_hint", False) else "singing")
             )
         else:
+            lex = effective_asr.get("_lexicon_video") or None
             text, segs = refine_dialog_transcript(
                 asr_result.text,
                 asr_result.segments,
+                lexicon_path=lex,
                 corrections=effective_asr.get("corrections"),
             )
-            meta["asr_post_refine"] = "dialog"
+            meta["asr_post_refine"] = "video_talking" if profile == "video_talking" else "dialog"
 
         asr_result.text = text
         asr_result.segments = segs
@@ -1015,8 +1122,14 @@ class CrossLingualPipeline:
             if per_r < min_ratio:
                 issues.append(f"per_seg_ok={per_r:.2f}<{min_ratio}")
         if issues:
-            result.quality_meta["degraded_reasons"] = issues
-            logger.warning(f"Run degraded: {'; '.join(issues)}")
+            prev = list(result.quality_meta.get("degraded_reasons") or [])
+            result.quality_meta["degraded_reasons"] = prev + [i for i in issues if i not in prev]
+            logger.warning(f"Run degraded: {'; '.join(result.quality_meta['degraded_reasons'])}")
+            return "degraded"
+        if result.quality_meta.get("degraded_reasons"):
+            logger.warning(
+                f"Run degraded: {'; '.join(result.quality_meta['degraded_reasons'])}"
+            )
             return "degraded"
         return "success"
 
@@ -1253,7 +1366,9 @@ class CrossLingualPipeline:
     }
 
     def _emotion_bucket(self, emotion: str) -> str:
-        return self._EMOTION_BUCKET.get((emotion or "neutral").lower(), "neutral")
+        from src.utils.stability import coerce_emotion_label
+        key = coerce_emotion_label(emotion).lower()
+        return self._EMOTION_BUCKET.get(key, "neutral")
 
     def _group_segments(self, segments):
         """
@@ -1965,6 +2080,8 @@ class CrossLingualPipeline:
 
         output_path = os.path.join(output_dir, "cloned_output.wav")
         AudioUtils.save_audio(full, output_path, clone_sr)
+        result.cloned_wav_path = output_path
+        result.output_dir = output_dir
         out_dur = len(full) / clone_sr
 
         # 7) 落盘结果 (翻译/分段/摘要)

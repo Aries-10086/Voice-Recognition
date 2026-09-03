@@ -1,0 +1,44 @@
+{
+  "language": "en",
+  "title": "Will Kent / Wiki Education talking head (20s excerpt)",
+  "source": "https://commons.wikimedia.org/wiki/File:Will_Kent_on_Wikidata%27s_usefulness_for_university_knowledge_sharing.webm",
+  "keywords": [
+    "Will Kent",
+    "Wiki Education",
+    "Wikidata",
+    "Wikipedia",
+    "education",
+    "movement",
+    "training",
+    "resources",
+    "classes",
+    "everybody"
+  ],
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.7,
+      "text": "Hi everybody, this is Will Kent from Wiki Education."
+    },
+    {
+      "start": 3.2,
+      "end": 9.1,
+      "text": "I'm here to tell you that I've got some classes coming up all about Wikidata and Wikipedia."
+    },
+    {
+      "start": 9.6,
+      "end": 15.7,
+      "text": "And I think that education in the movement is super important and the more people we can get on board, the better."
+    },
+    {
+      "start": 15.8,
+      "end": 18.2,
+      "text": "And the more training resources we have, the better."
+    },
+    {
+      "start": 18.4,
+      "end": 20.0,
+      "text": "And then we can just..."
+    }
+  ]
+}
