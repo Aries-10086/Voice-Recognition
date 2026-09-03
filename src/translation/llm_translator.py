@@ -206,8 +206,8 @@ class LLMTranslator:
             if polished != translated:
                 history.append(polished)
                 translated = polished
-                target_syllables = self._count_syllables(translated, target_lang)
-                length_ratio = target_syllables / max(source_syllables, 1)
+            target_syllables = self._count_syllables(translated, target_lang)
+            length_ratio = target_syllables / max(source_syllables, 1)
             self.last_backend = backend
             logger.info(
                 f"Translation ({backend}): [{source_lang}->{target_lang}] "
